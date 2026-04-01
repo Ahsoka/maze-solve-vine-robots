@@ -168,6 +168,71 @@ def minimum_distance_cost(graph, maze):
                     start_head = head.variables[0][0]
                     edge.add_constraint(end_tail == start_head)
 
+def quad_over_linear_cost(graph, maze):
+    maze_side = maze.nx
+    start = np.array([0.5, 0])
+    goal = np.array([maze_side - 0.5, maze_side])
+    # Add vertices.
+    for i in range(maze_side):
+        for j in range(maze_side):
+            vertex = graph.add_vertex((i, j))
+
+            # Trajectory start and end point within cell.
+            x = vertex.add_variable((2, 2))
+
+            # # Minimize distance traveled within cell.
+            # vertex.add_cost(cp.norm2(x[1] - x[0]))
+
+            # Constrain trajectory segment in cell.
+            l = np.array([i, j])
+            u = l + 1
+            vertex.add_constraints([x[0] >= l, x[0] <= u])
+            vertex.add_constraints([x[1] >= l, x[1] <= u])
+
+            # Fix start and goal points.
+            if all(l == 0):
+                vertex.add_constraint(x[0] == start)
+            elif all(u == maze_side):
+                vertex.add_constraint(x[1] == goal)
+
+    # Add edges between communicating cells.
+    for i in range(maze_side):
+        for j in range(maze_side):
+            cell = maze.get_cell(i, j)
+            tail = graph.get_vertex((i, j))
+            for direction, d in maze.directions.items():
+                if not cell.walls[direction]:
+                    head = graph.get_vertex((i + d[0], j + d[1]))
+                    edge = graph.add_edge(tail, head)
+
+                    # Enforce trajectory continuity.
+                    p1, p2 = tail.variables[0]
+                    p2_copy, p3 = head.variables[0]
+                    edge.add_constraint(p2 == p2_copy)
+
+                    # Angle cost.
+                    vertical = True
+                    if direction == "N":
+                        # edge.add_cost(cp.quad_over_lin(p2[0] - p1[0], p2[1] - p1[1]))
+                        # edge.add_cost(cp.quad_over_lin(p3[0] - p2[0], p3[1] - p2[1]))
+                        edge.add_cost(cp.quad_over_lin(p2[0] - p1[0], 1))
+                        edge.add_cost(cp.quad_over_lin(p3[0] - p2[0], 1))
+                    elif direction == "S":
+                        # edge.add_cost(cp.quad_over_lin(p2[0] - p1[0], p1[1] - p2[1]))
+                        # edge.add_cost(cp.quad_over_lin(p3[0] - p2[0], p2[1] - p3[1]))
+                        edge.add_cost(cp.quad_over_lin(p2[0] - p1[0], 1))
+                        edge.add_cost(cp.quad_over_lin(p3[0] - p2[0], 1))
+                    elif direction == "W":
+                        # edge.add_cost(cp.quad_over_lin(p2[1] - p1[1], p1[0] - p2[0]))
+                        # edge.add_cost(cp.quad_over_lin(p3[1] - p2[1], p2[0] - p3[0]))
+                        edge.add_cost(cp.quad_over_lin(p2[1] - p1[1], 1))
+                        edge.add_cost(cp.quad_over_lin(p3[1] - p2[1], 1))
+                    elif direction == "E":
+                        # edge.add_cost(cp.quad_over_lin(p2[1] - p1[1], p2[0] - p1[0]))
+                        # edge.add_cost(cp.quad_over_lin(p3[1] - p2[1], p3[0] - p2[0]))
+                        edge.add_cost(cp.quad_over_lin(p2[1] - p1[1], 1))
+                        edge.add_cost(cp.quad_over_lin(p3[1] - p2[1], 1))
+
 def construct_gcs_from_maze(
     maze_side: int = 5,
     knock_downs: int = 1,
