@@ -1,3 +1,4 @@
+from gcsopt import GraphOfConvexSets
 import matplotlib.pyplot as plt
 import cvxpy as cp
 import numpy as np
@@ -167,3 +168,18 @@ def minimum_distance_cost(graph, maze):
                     end_tail = tail.variables[0][1]
                     start_head = head.variables[0][0]
                     edge.add_constraint(end_tail == start_head)
+
+def construct_gcs_from_maze(
+    maze_side: int = 5,
+    knock_downs: int = 1,
+    random_seed: int = 0,
+    cost_constraints_func: callable = minimum_distance_cost
+):
+    maze = Maze(maze_side, maze_side, random_seed)
+    maze.knock_down_walls(knock_downs)
+
+    graph = GraphOfConvexSets()
+
+    cost_constraints_func(graph, maze)
+
+    return graph
