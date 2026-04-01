@@ -15,6 +15,7 @@ class Cell:
     def knock_down_wall(self, wall):
         self.walls[wall] = False
 
+
 class Maze:
     directions = {"W": (-1, 0), "E": (1, 0), "S": (0, -1), "N": (0, 1)}
 
