@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import numpy as np
 import random as rd
 
 class Cell:
@@ -78,3 +79,46 @@ class Maze:
                     plt.plot([x, x + 1], [y, y], c="k")
                 if self.get_cell(x, y).walls["W"]:
                     plt.plot([x, x], [y, y + 1], c="k")
+
+
+# NOTE: We might not need DFS here for finding the path.
+# We might be able to get away with an even simplier algorithm of following the attached
+# nodes, which I guess is essentially what DFS is doing anyway.  We can strip out a lot
+# randomness and backtracking from DFS, since we know the path is a simple path with no loops.
+def single_dfs(graph, source, target):
+    """
+    Perform a randomized depth-first search (DFS) from source to target in a
+    graph.
+    """
+
+    # initialize path and set of visited vertices
+    path = [source]
+    visited = []
+
+    # repeat until target is reached
+    while path:
+        if path[-1] == target:
+            return path
+
+        # collect neighbors and probabilities
+        neighbors = []
+        probabilities = []
+        for edge in graph.outgoing_edges(path[-1]):
+            neighbor = edge.head
+            probability = edge.binary_variable.value
+            if neighbor not in path + visited and probability > 0:
+                neighbors.append(neighbor)
+                probabilities.append(probability)
+
+        # explore random neighbor
+        if neighbors:
+            probabilities = np.array(probabilities) / sum(probabilities)
+            neighbor = np.random.choice(neighbors, p=probabilities)
+            path.append(neighbor)
+
+        # backtrack and prevent revisit of same vertex
+        else:
+            visited.append(path.pop())
+
+    # path not found
+    return None
