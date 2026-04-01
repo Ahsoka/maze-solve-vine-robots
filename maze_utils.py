@@ -236,19 +236,19 @@ def quad_over_linear_cost(graph, maze):
 def construct_gcs_from_maze(
     maze_side: int = 5,
     knock_downs: int = 1,
-    random_seed: int = 0,
+    seed: int = 0,
     cost_constraints_func: callable = minimum_distance_cost
 ):
-    maze = Maze(maze_side, maze_side, random_seed)
+    maze = Maze(maze_side, maze_side, seed)
     maze.knock_down_walls(knock_downs)
 
     graph = GraphOfConvexSets()
 
     cost_constraints_func(graph, maze)
 
-    return graph
+    return graph, maze
 
-def angles(graph, maze):
+def calc_angles(graph, maze):
     # NOTE: I think this should work for checking if the .solve_shortest_path path function
     # was called. Should ask Tobia to verify.
     assert graph.status == "optimal", f"Graph status is {graph.status}, expected 'optimal'"
