@@ -5,7 +5,6 @@ import numpy as np
 import random as rd
 
 class Cell:
-
     def __init__(self, x, y):
         self.x = x
         self.y = y
