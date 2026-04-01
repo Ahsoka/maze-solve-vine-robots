@@ -247,3 +247,26 @@ def construct_gcs_from_maze(
     cost_constraints_func(graph, maze)
 
     return graph
+
+def angles(graph, maze):
+    # NOTE: I think this should work for checking if the .solve_shortest_path path function
+    # was called. Should ask Tobia to verify.
+    assert graph.status == "optimal", f"Graph status is {graph.status}, expected 'optimal'"
+
+    maze_side = maze.nx
+
+    source = graph.get_vertex((0, 0))
+    target = graph.get_vertex((maze_side - 1, maze_side - 1))
+    path = single_dfs(graph, source, target)
+    points = np.array(
+        list(map(lambda vertices: vertices.variables[0].value, path))
+    )
+
+    points = points[np.linalg.norm(points[:, 1] - points[:, 0], axis=1) > 1e-3]
+    points[1:, 0] = points[:-1, 1] # Make the start of each segment the same as the end of the previous segment.
+
+    vectors = points[:, 1] - points[:, 0]
+    dot = np.sum(vectors[:-1] * vectors[1:], axis=1)
+    norms1 = np.linalg.norm(vectors[:-1], axis=1)
+    norms2 = np.linalg.norm(vectors[1:], axis=1)
+    return np.arccos(dot / (norms1 * norms2))
