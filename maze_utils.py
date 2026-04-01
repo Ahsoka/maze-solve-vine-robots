@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import cvxpy as cp
 import numpy as np
 import random as rd
 
@@ -123,3 +124,46 @@ def single_dfs(graph, source, target):
 
     # path not found
     return None
+
+def minimum_distance_cost(graph, maze):
+    maze_side = maze.nx
+    start = np.array([0.5, 0])
+    goal = np.array([maze_side - 0.5, maze_side])
+
+    # Add vertices.
+    for i in range(maze_side):
+        for j in range(maze_side):
+            vertex = graph.add_vertex((i, j))
+
+            # Trajectory start and end point within cell.
+            x = vertex.add_variable((2, 2))
+
+            # Minimize distance traveled within cell.
+            vertex.add_cost(cp.norm2(x[1] - x[0]))
+
+            # Constrain trajectory segment in cell.
+            l = np.array([i, j])
+            u = l + 1
+            vertex.add_constraints([x[0] >= l, x[0] <= u])
+            vertex.add_constraints([x[1] >= l, x[1] <= u])
+
+            # Fix start and goal points.
+            if all(l == 0):
+                vertex.add_constraint(x[0] == start)
+            elif all(u == maze_side):
+                vertex.add_constraint(x[1] == goal)
+
+    # Add edges between communicating cells.
+    for i in range(maze_side):
+        for j in range(maze_side):
+            cell = maze.get_cell(i, j)
+            tail = graph.get_vertex((i, j))
+            for direction, d in maze.directions.items():
+                if not cell.walls[direction]:
+                    head = graph.get_vertex((i + d[0], j + d[1]))
+                    edge = graph.add_edge(tail, head)
+
+                    # Enforce trajectory continuity.
+                    end_tail = tail.variables[0][1]
+                    start_head = head.variables[0][0]
+                    edge.add_constraint(end_tail == start_head)
