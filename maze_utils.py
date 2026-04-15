@@ -213,25 +213,17 @@ def quad_over_linear_cost(graph, maze):
                     # Angle cost.
                     vertical = True
                     if direction == "N":
-                        # edge.add_cost(cp.quad_over_lin(p2[0] - p1[0], p2[1] - p1[1]))
-                        # edge.add_cost(cp.quad_over_lin(p3[0] - p2[0], p3[1] - p2[1]))
-                        edge.add_cost(cp.quad_over_lin(p2[0] - p1[0], 1))
-                        edge.add_cost(cp.quad_over_lin(p3[0] - p2[0], 1))
+                        edge.add_cost(cp.quad_over_lin(p2[0] - p1[0], p2[1] - p1[1]))
+                        edge.add_cost(cp.quad_over_lin(p3[0] - p2[0], p3[1] - p2[1]))
                     elif direction == "S":
-                        # edge.add_cost(cp.quad_over_lin(p2[0] - p1[0], p1[1] - p2[1]))
-                        # edge.add_cost(cp.quad_over_lin(p3[0] - p2[0], p2[1] - p3[1]))
-                        edge.add_cost(cp.quad_over_lin(p2[0] - p1[0], 1))
-                        edge.add_cost(cp.quad_over_lin(p3[0] - p2[0], 1))
+                        edge.add_cost(cp.quad_over_lin(p2[0] - p1[0], p1[1] - p2[1]))
+                        edge.add_cost(cp.quad_over_lin(p3[0] - p2[0], p2[1] - p3[1]))
                     elif direction == "W":
-                        # edge.add_cost(cp.quad_over_lin(p2[1] - p1[1], p1[0] - p2[0]))
-                        # edge.add_cost(cp.quad_over_lin(p3[1] - p2[1], p2[0] - p3[0]))
-                        edge.add_cost(cp.quad_over_lin(p2[1] - p1[1], 1))
-                        edge.add_cost(cp.quad_over_lin(p3[1] - p2[1], 1))
+                        edge.add_cost(cp.quad_over_lin(p2[1] - p1[1], p1[0] - p2[0]))
+                        edge.add_cost(cp.quad_over_lin(p3[1] - p2[1], p2[0] - p3[0]))
                     elif direction == "E":
-                        # edge.add_cost(cp.quad_over_lin(p2[1] - p1[1], p2[0] - p1[0]))
-                        # edge.add_cost(cp.quad_over_lin(p3[1] - p2[1], p3[0] - p2[0]))
-                        edge.add_cost(cp.quad_over_lin(p2[1] - p1[1], 1))
-                        edge.add_cost(cp.quad_over_lin(p3[1] - p2[1], 1))
+                        edge.add_cost(cp.quad_over_lin(p2[1] - p1[1], p2[0] - p1[0]))
+                        edge.add_cost(cp.quad_over_lin(p3[1] - p2[1], p3[0] - p2[0]))
 
 def construct_gcs_from_maze(
     maze_side: int = 5,
