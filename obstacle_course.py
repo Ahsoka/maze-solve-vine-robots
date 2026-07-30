@@ -420,7 +420,7 @@ class PathPlanner:
     end: np.ndarray | None = field(default=None)
 
     graph: nx.Graph = field(init=False)
-    line_graph: nx.Graph = field(init=False)
+    line_graph: nx.DiGraph = field(init=False)
 
     angle_path: LineString | None = field(init=False, default=None)
     total_angle: float | None = field(init=False, default=None)
@@ -606,52 +606,51 @@ class PathPlanner:
                 self.graph.add_edge(*edge, weight=line.length)
 
     def create_line_graph(self):
-        self.line_graph = nx.line_graph(self.graph)
+        """Build the *directed* line graph of the visibility graph.
 
-        # Each node in the line graph represents an edge in the
-        # original visibility graph.
-        line_graph_edges = list(self.line_graph.edges)
+        A node is an ordered pair ``(u, v)``, read as "the robot
+        traverses the visibility edge ``{u, v}`` from ``u`` toward
+        ``v``". An arc joins ``(u, v)`` to ``(v, w)`` and carries the
+        unsigned turning angle at ``v``. Reversals ``(u, v) -> (v, u)``
+        are excluded because a vine robot cannot double back along its
+        own body.
 
-        if line_graph_edges:
-            previous_points = []
-            shared_points = []
-            next_points = []
+        Encoding the direction of travel in the node is what makes the
+        construction sound: every directed path is a legal walk in the
+        original graph by construction, and every transition cost is
+        evaluated with the same orientation that the walk actually uses.
+        An undirected line graph cannot guarantee either, because two
+        consecutive line-graph edges may share the same original vertex,
+        which silently encodes an uncharged U-turn.
+        """
+        self.line_graph = nx.DiGraph()
 
-            # Extract the three original-graph points associated with
-            # every transition between two adjacent edges.
-            for original_edge_1, original_edge_2 in line_graph_edges:
-                if original_edge_1[0] in original_edge_2:
-                    shared = original_edge_1[0]
-                    previous = original_edge_1[1]
-                elif original_edge_1[1] in original_edge_2:
-                    shared = original_edge_1[1]
-                    previous = original_edge_1[0]
-                else:
-                    raise RuntimeError(
-                        "Adjacent line-graph nodes do not share an "
-                        "original-graph vertex."
-                    )
+        # One node per directed traversal of each visibility edge.
+        self.line_graph.add_nodes_from(self.graph.to_directed().edges)
 
-                next_point = (
-                    original_edge_2[1]
-                    if original_edge_2[0] == shared
-                    else original_edge_2[0]
-                )
+        # Every legal transition through a vertex: arrive from
+        # ``previous``, leave toward ``next_point``. ``permutations``
+        # already excludes ``previous == next_point``, i.e. reversals.
+        transitions = [
+            ((previous, shared), (shared, next_point))
+            for shared in self.graph.nodes
+            for previous, next_point in itertools.permutations(
+                self.graph.neighbors(shared),
+                2,
+            )
+        ]
 
-                previous_points.append(previous)
-                shared_points.append(shared)
-                next_points.append(next_point)
-
+        if transitions:
             previous_points = np.asarray(
-                previous_points,
+                [tail[0] for tail, _ in transitions],
                 dtype=float,
             )
             shared_points = np.asarray(
-                shared_points,
+                [tail[1] for tail, _ in transitions],
                 dtype=float,
             )
             next_points = np.asarray(
-                next_points,
+                [head[1] for _, head in transitions],
                 dtype=float,
             )
 
@@ -699,14 +698,14 @@ class PathPlanner:
             turning_angles = np.arccos(cosine_angles)
 
             # Assign the precomputed turning costs.
-            for line_edge, angle in zip(
-                line_graph_edges,
-                turning_angles,
-                strict=True,
-            ):
-                self.line_graph.edges[line_edge]["weight"] = float(
-                    angle
+            self.line_graph.add_edges_from(
+                (tail, head, {"weight": float(angle)})
+                for (tail, head), angle in zip(
+                    transitions,
+                    turning_angles,
+                    strict=True,
                 )
+            )
 
         # --------------------------------------------------------------
         # Add terminal nodes
@@ -725,29 +724,21 @@ class PathPlanner:
         self.line_graph.add_node(start_node)
         self.line_graph.add_node(end_node)
 
-        # Save this list before adding terminal connections. Every node
-        # here represents an original visibility-graph edge.
-        original_line_nodes = [
-            node
-            for node in self.line_graph.nodes
-            if node not in {start_node, end_node}
-        ]
+        # The first segment leaves the start; the last segment arrives
+        # at the goal. Neither incurs a turning cost.
+        for neighbor in self.graph.neighbors(original_start):
+            self.line_graph.add_edge(
+                start_node,
+                (original_start, neighbor),
+                weight=0.0,
+            )
 
-        for line_node in original_line_nodes:
-            # line_node is an original graph edge: (point_a, point_b).
-            if original_start in line_node:
-                self.line_graph.add_edge(
-                    start_node,
-                    line_node,
-                    weight=0.0,
-                )
-
-            if original_end in line_node:
-                self.line_graph.add_edge(
-                    line_node,
-                    end_node,
-                    weight=0.0,
-                )
+        for neighbor in self.graph.neighbors(original_end):
+            self.line_graph.add_edge(
+                (neighbor, original_end),
+                end_node,
+                weight=0.0,
+            )
 
         return self.line_graph
 
@@ -829,31 +820,21 @@ class PathPlanner:
                 "No collision-free angle path exists between start and end."
             ) from error
 
-        original_edges = line_path[1:-1]
+        # Interior nodes are directed traversals ``(u, v)`` of the
+        # original graph, so the walk is just the tail of the first one
+        # followed by the head of each in turn.
+        directed_edges = line_path[1:-1]
+
         start = tuple(np.asarray(self.start, dtype=float))
         end = tuple(np.asarray(self.end, dtype=float))
 
-        path_vertices = [start]
-        current = start
+        path_vertices = [directed_edges[0][0]]
+        path_vertices.extend(head for _, head in directed_edges)
 
-        for edge in original_edges:
-            point_a, point_b = edge
-
-            if current == point_a:
-                current = point_b
-            elif current == point_b:
-                current = point_a
-            else:
-                raise RuntimeError(
-                    "The line-graph path could not be reconstructed as "
-                    "a continuous path in the original graph."
-                )
-
-            path_vertices.append(current)
-
-        if current != end:
+        if path_vertices[0] != start or path_vertices[-1] != end:
             raise RuntimeError(
-                "The reconstructed angle path does not terminate at the goal."
+                "The reconstructed angle path does not run from the "
+                "start to the goal."
             )
 
         self.angle_path = LineString(path_vertices)
