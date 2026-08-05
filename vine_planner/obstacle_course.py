@@ -1,14 +1,21 @@
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
-import itertools
 import shapely
 
-from .utils import grow_barrier
 from .constants import _LENGTH_TO_FEET
 from shapely.plotting import plot_polygon
 from attrs import define, field, validators
-from shapely import Polygon, Point, LineString
+from shapely import Polygon
+from .utils import (
+    clip_segment,
+    grow_barrier,
+    corner_interval,
+    annulus_obstacle,
+    bridge_segment,
+    intersect_intervals,
+    free_parameter_intervals
+)
 
 
 @define
@@ -222,165 +229,7 @@ class ObstacleCourse:
             Polygon(far_barrier),
         ]
 
-        # ------------------------------------------------------------------
-        # Standard obstacles
-        # ------------------------------------------------------------------
-
-        def sample_angles(count: int) -> np.ndarray:
-            """Sorted vertex angles whose largest gap stays below pi.
-
-            Independent uniform angles are the standard construction, but
-            sorting them is not on its own enough to keep the polygon
-            simple: once the largest gap between consecutive angles
-            reaches pi, the chord that closes it passes on the far side of
-            the center and can cut across the other edges. Holding every
-            gap below pi confines each edge to its own angular wedge, and
-            wedges cannot cross, so the polygon is simple by construction.
-            """
-            for _ in range(100):
-                angles = np.sort(
-                    rng.uniform(0.0, 2.0 * np.pi, count)
-                )
-
-                gaps = np.diff(
-                    np.concatenate((angles, angles[:1] + 2.0 * np.pi))
-                )
-
-                if gaps.max() < np.pi:
-                    return angles
-
-            # Unreachable in practice. Evenly spaced angles at a random
-            # phase leave every gap at 2 pi / count, which is below pi for
-            # any polygon with three or more vertices.
-            return (
-                2.0 * np.pi * np.arange(count) / count
-                + rng.uniform(0.0, 2.0 * np.pi / count)
-            )
-
         course_region = shapely.box(0.0, 0.0, width, height)
-
-        def current_free_space():
-            """Course region minus every polygon generated so far.
-
-            The subtraction intentionally uses the vectorized Shapely
-            functions rather than manual coordinate tests. Recomputing this
-            region before each new obstacle makes the acceptance test account
-            for every polygon already appended to ``polygons``.
-            """
-            occupied_region = shapely.union_all(polygons)
-            return shapely.difference(course_region, occupied_region)
-
-        def annulus_obstacle(
-            center: np.ndarray,
-            *,
-            forbidden_points=(),
-            max_attempts: int = 5000,
-            raise_on_failure: bool = True,
-        ):
-            """Sample one annulus obstacle entirely inside current free space.
-
-            Angles and radii retain the original annulus construction. A draw
-            is accepted only when every sampled vertex lies in the Shapely
-            free-space set and the complete candidate polygon is covered by
-            that same set. The candidate must also contain its nominal center,
-            preserving the meaning of the supplied line-placement point as the
-            obstacle center.
-
-            ``forbidden_points`` are future line centers. Rejecting candidates
-            that cover any of them prevents an earlier obstacle from consuming
-            the center needed by a later obstacle.
-            """
-            center = np.asarray(center, dtype=float)
-            free_space = current_free_space()
-            center_point = Point(center)
-            forbidden_geometry = (
-                shapely.points(np.asarray(forbidden_points, dtype=float))
-                if len(forbidden_points)
-                else None
-            )
-
-            if not shapely.covers(free_space, center_point):
-                if raise_on_failure:
-                    raise RuntimeError(
-                        "The requested obstacle center is not in the current "
-                        "Shapely free-space region."
-                    )
-
-                return None
-
-            for _ in range(max_attempts):
-                number_of_vertices = int(
-                    rng.integers(min_vertices, max_vertices + 1)
-                )
-
-                angles = sample_angles(number_of_vertices)
-                radii = rng.uniform(
-                    min_radius,
-                    max_radius,
-                    number_of_vertices,
-                )
-                vertices = (
-                    center
-                    + radii[:, None] * np.column_stack((
-                        np.cos(angles),
-                        np.sin(angles),
-                    ))
-                )
-
-                # Enforce the vertex-level requirement directly using the
-                # Shapely set difference defining the current free space.
-                vertex_points = shapely.points(vertices)
-                if not np.all(shapely.covers(free_space, vertex_points)):
-                    continue
-
-                candidate = Polygon(vertices)
-
-                if (
-                    candidate.is_empty
-                    or not candidate.is_valid
-                    or candidate.area <= 0.0
-                    or not shapely.contains(candidate, center_point)
-                ):
-                    continue
-
-                # Vertices being free is not sufficient by itself: an edge can
-                # cross an occupied polygon while both endpoints remain free.
-                # Requiring the whole candidate to be covered by free space
-                # guarantees zero positive-area overlap. Boundary contact is
-                # allowed, but obstacle interiors remain disjoint.
-                if not shapely.covers(free_space, candidate):
-                    continue
-
-                if forbidden_geometry is not None and np.any(
-                    shapely.intersects(candidate, forbidden_geometry)
-                ):
-                    continue
-
-                return candidate
-
-            if raise_on_failure:
-                raise RuntimeError(
-                    "Could not sample a non-overlapping obstacle around the "
-                    "requested line center. Reduce num_obstacles or radius, "
-                    "or increase the course dimensions."
-                )
-
-            return None
-
-        # ------------------------------------------------------------------
-        # Clusters in the two corners the barriers do not reach
-        # ------------------------------------------------------------------
-
-        def corner_interval(
-            target: float,
-            low: float,
-            high: float,
-            span: float,
-        ) -> tuple[float, float]:
-            if target <= low:
-                return low, min(low + span, high)
-
-            return max(high - span, low), high
 
         span_x = corner_span_fraction * width
         span_y = corner_span_fraction * height
@@ -411,6 +260,13 @@ class ObstacleCourse:
                     ])
                     obstacle = annulus_obstacle(
                         center,
+                        rng,
+                        min_vertices,
+                        max_vertices,
+                        min_radius,
+                        max_radius,
+                        polygons,
+                        course_region,
                         raise_on_failure=False,
                     )
 
@@ -423,121 +279,6 @@ class ObstacleCourse:
                         "corner cluster. Reduce corner_obstacles or radius, "
                         "or increase corner_span_fraction."
                     )
-
-        # ------------------------------------------------------------------
-        # The rest: centers along offsets of two shortest-path bridge edges
-        # ------------------------------------------------------------------
-
-        def clip_segment(start: np.ndarray, end: np.ndarray):
-            """Parameter range of ``start -> end`` inside the inset box.
-
-            Liang-Barsky: walk the four slabs, tightening the parameter
-            interval, and bail out as soon as it becomes empty. The shifted
-            bridge segments begin near barrier vertices, so they generally
-            need trimming to keep complete obstacles inside the course.
-            """
-            direction = end - start
-
-            low = 0.0
-            high = 1.0
-
-            for numerator, denominator in (
-                (start[0] - inset_low_x, -direction[0]),
-                (inset_high_x - start[0], direction[0]),
-                (start[1] - inset_low_y, -direction[1]),
-                (inset_high_y - start[1], direction[1]),
-            ):
-                if denominator == 0.0:
-                    if numerator < 0.0:
-                        return None
-
-                    continue
-
-                ratio = numerator / denominator
-
-                if denominator < 0.0:
-                    if ratio > high:
-                        return None
-
-                    low = max(low, ratio)
-                else:
-                    if ratio < low:
-                        return None
-
-                    high = min(high, ratio)
-
-            if high <= low:
-                return None
-
-            return low, high
-
-        def free_parameter_intervals(
-            start: np.ndarray,
-            end: np.ndarray,
-            span: tuple[float, float],
-        ) -> list[tuple[float, float]]:
-            """Intervals whose shifted-line centers lie in current free space.
-
-            The wall-clipped line is differenced from the current occupied
-            polygon union with Shapely. Each remaining LineString component is
-            then converted back to the original segment parameter.
-            """
-            low, high = span
-            direction = end - start
-            squared_length = float(np.dot(direction, direction))
-
-            clipped_start = start + low * direction
-            clipped_end = start + high * direction
-            clipped_line = LineString((clipped_start, clipped_end))
-            occupied_region = shapely.union_all(polygons)
-            free_line = shapely.difference(clipped_line, occupied_region)
-            intervals = []
-
-            for part in shapely.get_parts(free_line):
-                if part.geom_type != "LineString" or part.length <= 0.0:
-                    continue
-
-                coordinates = np.asarray(part.coords, dtype=float)
-                parameters = (
-                    (coordinates - start) @ direction / squared_length
-                )
-                interval_low = max(low, float(parameters.min()))
-                interval_high = min(high, float(parameters.max()))
-
-                if interval_high > interval_low:
-                    intervals.append((interval_low, interval_high))
-
-            intervals.sort()
-            return intervals
-
-        def intersect_intervals(
-            first: list[tuple[float, float]],
-            second: list[tuple[float, float]],
-        ) -> list[tuple[float, float]]:
-            """Pairwise intersections of two sorted interval collections."""
-            intersections = []
-            first_index = 0
-            second_index = 0
-
-            while first_index < len(first) and second_index < len(second):
-                low = max(
-                    first[first_index][0],
-                    second[second_index][0],
-                )
-                high = min(
-                    first[first_index][1],
-                    second[second_index][1],
-                )
-
-                if high > low:
-                    intersections.append((low, high))
-
-                if first[first_index][1] < second[second_index][1]:
-                    first_index += 1
-                else:
-                    second_index += 1
-
-            return intersections
 
         remaining = num_obstacles - reserved_obstacles
 
@@ -570,30 +311,6 @@ class ObstacleCourse:
                 simplified_course.obstacles[1].exterior.coords[:-1]
             )
 
-            def bridge_segment(path_vertices):
-                """Return the path's unique direct edge from A to B.
-
-                The returned edge is always oriented from obstacle A toward
-                obstacle B. Paths without exactly one such edge are ignored.
-                """
-                crossings = []
-
-                for first, second in itertools.pairwise(path_vertices):
-                    first_on_a = first in obstacle_a_vertices
-                    first_on_b = first in obstacle_b_vertices
-                    second_on_a = second in obstacle_a_vertices
-                    second_on_b = second in obstacle_b_vertices
-
-                    if first_on_a and second_on_b:
-                        crossings.append((first, second))
-                    elif first_on_b and second_on_a:
-                        crossings.append((second, first))
-
-                if len(crossings) != 1:
-                    return None
-
-                return crossings[0]
-
             # nx.shortest_simple_paths yields paths in nondecreasing total
             # visibility-graph length. The first usable path is therefore the
             # shortest path. After fixing its bridge (a_i, b_j), continue in
@@ -615,7 +332,7 @@ class ObstacleCourse:
                 )
 
                 for path_vertices in candidate_paths:
-                    bridge = bridge_segment(path_vertices)
+                    bridge = bridge_segment(path_vertices, obstacle_a_vertices, obstacle_b_vertices)
 
                     if bridge is None:
                         continue
@@ -667,7 +384,14 @@ class ObstacleCourse:
                 for vertical_offset in vertical_offsets:
                     shifted_start = bridge_start + vertical_offset
                     shifted_end = bridge_end + vertical_offset
-                    span = clip_segment(shifted_start, shifted_end)
+                    span = clip_segment(
+                        shifted_start,
+                        shifted_end,
+                        inset_low_x,
+                        inset_low_y,
+                        inset_high_x,
+                        inset_high_y
+                    )
 
                     if span is None:
                         raise RuntimeError(
@@ -680,6 +404,7 @@ class ObstacleCourse:
                         shifted_start,
                         shifted_end,
                         span,
+                        polygons
                     )
 
                     if not free_intervals:
@@ -865,6 +590,13 @@ class ObstacleCourse:
                 for center_index, center in enumerate(line_centers):
                     obstacle = annulus_obstacle(
                         center,
+                        rng,
+                        min_vertices,
+                        max_vertices,
+                        min_radius,
+                        max_radius,
+                        polygons,
+                        course_region,
                         forbidden_points=line_centers[center_index + 1:],
                         max_attempts=800,
                         raise_on_failure=False,
