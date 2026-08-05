@@ -7,20 +7,13 @@ import shapely
 from attrs import define, field, validators
 from shapely.plotting import plot_polygon
 from shapely import Polygon, Point, LineString
-
-
-YIELD_PRESSURE_PSI = 0.278
-LENGTH_FRICTION_PSI_PER_FT = 0.0341
-TAIL_TENSION_PSI = 1.207
-CURVATURE_FRICTION_COEFFICIENT = 0.234
-
-_LENGTH_TO_FEET = {
-    "ft": 1.0,
-    "in": 1.0 / 12.0,
-    "m": 3.280839895013123,
-    "cm": 0.03280839895013123,
-}
-
+from .constants import (
+    YIELD_PRESSURE_PSI,
+    LENGTH_FRICTION_PSI_PER_FT,
+    TAIL_TENSION_PSI,
+    CURVATURE_FRICTION_COEFFICIENT,
+    _LENGTH_TO_FEET
+)
 
 def vine_robot_pressure(
     length: float,
