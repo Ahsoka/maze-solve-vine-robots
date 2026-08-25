@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
+import itertools
 import shapely
 
 from .constants import _LENGTH_TO_FEET
@@ -29,6 +30,25 @@ class ObstacleCourse:
     def __attrs_post_init__(self):
         self.obstacles_region = shapely.union_all(self.obstacles)
         shapely.prepare(self.obstacles_region)
+
+    def vaild_goal(self, coords):
+        """
+        Check if a point is a valid start or end point.
+        Ff the point is in the obstacle course and the point
+        is not inside any obstacles then it is a valid goal.
+        """
+        point = shapely.Point(
+            float(coords[0]),
+            float(coords[1]),
+        )
+        return (
+            # Check if it's inside to obstacle course
+            0 <= coords[0] <= self.width
+            and 0 <= coords[1] <= self.height
+            # Check if the point is inside any obstacles
+            and not self.obstacles_region.contains(point)
+        )
+
 
     @classmethod
     def random(
@@ -624,6 +644,21 @@ class ObstacleCourse:
             height=height,
             obstacles=polygons,
         )
+
+    @property
+    def vertices(self):
+        vertices = []
+        for point in itertools.chain.from_iterable(
+            map(lambda obstacle: obstacle.exterior.coords[:-1], self.obstacles)
+        ):
+            if not shapely.contains_xy(self.obstacles_region, *point):
+                vertices.append(point)
+
+        return vertices
+
+    def is_visible(self, vertex1, vertex2):
+        line = shapely.LineString((vertex1, vertex2))
+        return self.obstacles_region.disjoint(line) or self.obstacles_region.touches(line)
 
     def plot(
         self,

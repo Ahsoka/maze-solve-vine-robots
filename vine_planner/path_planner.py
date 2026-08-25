@@ -49,32 +49,9 @@ class PathPlanner:
                 f"{attribute.name} must contain exactly two coordinates."
             )
 
-        point = Point(
-            float(value[0]),
-            float(value[1]),
-        )
-
-        course_region = shapely.box(
-            0.0,
-            0.0,
-            self.obstacle_course.width,
-            self.obstacle_course.height,
-        )
-
-        # covers() includes the course boundary.
-        if not course_region.covers(point):
+        if not self.obstacle_course.vaild_goal(value):
             raise ValueError(
-                f"{attribute.name} is outside the obstacle course."
-            )
-
-        # contains() excludes the obstacle boundary, so points exactly
-        # on an obstacle boundary remain valid.
-        if any(
-            obstacle.contains(point)
-            for obstacle in self.obstacle_course.obstacles or []
-        ):
-            raise ValueError(
-                f"{attribute.name} is inside an obstacle."
+                f"{attribute.name} is outside the obstacle course or inside an obstacle."
             )
 
     def _goal_generator(self) -> None:
@@ -191,22 +168,16 @@ class PathPlanner:
 
     def create_graph(self):
         self.graph = nx.Graph()
+        vertices = self.obstacle_course.vertices
+        vertices.extend([tuple(self.start), tuple(self.end)])
+        self.graph.add_nodes_from(vertices)
 
-        # Add all points not in the interior of any polygon
-        obstacle_region = self.obstacle_course.obstacles_region
-        vertices = [tuple(self.start), tuple(self.end)]
-        for point in itertools.chain.from_iterable(
-            map(lambda obstacle: obstacle.exterior.coords[:-1], self.obstacle_course.obstacles)
-        ):
-            if not shapely.contains_xy(obstacle_region, *point):
-                vertices.append(point)
-                self.graph.add_node(point)
-
-        # Construct all visible edges
         for edge in itertools.combinations(vertices, 2):
-            line = shapely.LineString(edge)
-            if obstacle_region.disjoint(line) or obstacle_region.touches(line):
-                self.graph.add_edge(*edge, weight=line.length)
+            if self.obstacle_course.is_visible(*edge):
+                self.graph.add_edge(
+                    *edge,
+                    weight=np.linalg.norm(np.array(edge[0]) - np.array(edge[1]))
+                )
 
     def create_line_graph(self):
         """Build the *directed* line graph of the visibility graph.
