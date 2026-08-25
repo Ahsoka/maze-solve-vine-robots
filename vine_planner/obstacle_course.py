@@ -10,13 +10,16 @@ from attrs import define, field, validators
 from shapely import Polygon
 from .utils import (
     clip_segment,
+    path_metrics,
+    path_pressure,
     grow_barrier,
+    bridge_segment,
     corner_interval,
     annulus_obstacle,
-    bridge_segment,
     intersect_intervals,
     free_parameter_intervals
 )
+
 
 
 @define
@@ -708,6 +711,140 @@ class ObstacleCourse:
         ax.set_ylabel("y")#, zorder=1)
         ax.set_title(title or "Obstacle Course")
         ax.grid(alpha=0.25)
+
+        if show:
+            plt.show()
+
+        return fig, ax
+
+    def plot_path(
+        self,
+        start,
+        end,
+        distance_path = None,
+        angle_path = None,
+        ax: plt.Axes = None,
+        show_vertices: bool = True,
+        show_labels: bool = False,
+        title: str = None,
+        show: bool = True,
+        length_units: str = "ft",
+        angle_units: str = "degrees",
+    ) -> tuple[plt.Figure, plt.Axes]:
+        """Plot the course, goals, and any computed paths.
+
+        Path coordinates are interpreted as ``length_units``. Angles are
+        displayed in degrees by default; pass ``angle_units="radians"``
+        to report them in radians. Pressure is always reported in psi.
+        """
+        normalized_length_units = length_units.lower()
+        if normalized_length_units not in _LENGTH_TO_FEET:
+            raise ValueError(
+                "length_units must be one of: 'ft', 'in', 'm', or 'cm'."
+            )
+
+        normalized_angle_units = angle_units.lower()
+        if normalized_angle_units in {"degree", "degrees", "deg"}:
+            angle_scale = 180.0 / np.pi
+            angle_label = "deg"
+        elif normalized_angle_units in {"radian", "radians", "rad"}:
+            angle_scale = 1.0
+            angle_label = "rad"
+        else:
+            raise ValueError(
+                "angle_units must be 'degrees' or 'radians'."
+            )
+        fig, ax = self.plot(
+            ax=ax,
+            show_vertices=show_vertices,
+            show_labels=show_labels,
+            title=title,
+            show=False,
+        )
+
+        ax.scatter(
+            start[0],
+            start[1],
+            s=80,
+            marker="o",
+            color="green",
+            label="start",
+            clip_on=False,
+            zorder=5,
+        )
+        ax.scatter(
+            end[0],
+            end[1],
+            s=120,
+            marker="*",
+            color="purple",
+            label="target",
+            clip_on=False,
+            zorder=5,
+        )
+
+        if distance_path is not None:
+            distance_coords = np.asarray(
+                distance_path.coords,
+                dtype=float,
+            )
+            distance_length, distance_angle_radians = path_metrics(
+                distance_path
+            )
+            distance_angle_display = (
+                distance_angle_radians * angle_scale
+            )
+            # The recursive model depends on where each bend sits along
+            # the path, not just the totals, so the pressure is evaluated
+            # from the path geometry rather than from (length, angle).
+            distance_pressure = path_pressure(
+                distance_path,
+                length_units=normalized_length_units,
+            )
+
+            ax.plot(
+                distance_coords[:, 0],
+                distance_coords[:, 1],
+                linewidth=2.5,
+                color="tab:red",
+                label=(
+                    "min distance "
+                    f"(length={distance_length:.2f} {normalized_length_units}, "
+                    f"angle={distance_angle_display:.2f} {angle_label}, "
+                    f"pressure={distance_pressure:.3f} psi)"
+                ),
+                zorder=4,
+            )
+
+        if angle_path is not None:
+            angle_coords = np.asarray(
+                angle_path.coords,
+                dtype=float,
+            )
+            angle_length, angle_cost_radians = path_metrics(angle_path)
+
+            angle_cost_display = angle_cost_radians * angle_scale
+            angle_pressure = path_pressure(
+                angle_path,
+                length_units=normalized_length_units,
+            )
+
+            ax.plot(
+                angle_coords[:, 0],
+                angle_coords[:, 1],
+                linewidth=2.5,
+                linestyle="--",
+                color="tab:orange",
+                label=(
+                    "min angle "
+                    f"(length={angle_length:.2f} {normalized_length_units}, "
+                    f"angle={angle_cost_display:.2f} {angle_label}, "
+                    f"pressure={angle_pressure:.3f} psi)"
+                ),
+                zorder=4,
+            )
+
+        ax.legend()
 
         if show:
             plt.show()

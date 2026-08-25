@@ -10,7 +10,6 @@ from shapely import Point, LineString
 from .obstacle_course import ObstacleCourse
 from .utils import (
     pressure_profile,
-    path_pressure,
     path_metrics
 )
 
@@ -505,122 +504,17 @@ class PathPlanner:
         displayed in degrees by default; pass ``angle_units="radians"``
         to report them in radians. Pressure is always reported in psi.
         """
-        normalized_length_units = length_units.lower()
-        if normalized_length_units not in _LENGTH_TO_FEET:
-            raise ValueError(
-                "length_units must be one of: 'ft', 'in', 'm', or 'cm'."
-            )
-
-        normalized_angle_units = angle_units.lower()
-        if normalized_angle_units in {"degree", "degrees", "deg"}:
-            angle_scale = 180.0 / np.pi
-            angle_label = "deg"
-        elif normalized_angle_units in {"radian", "radians", "rad"}:
-            angle_scale = 1.0
-            angle_label = "rad"
-        else:
-            raise ValueError(
-                "angle_units must be 'degrees' or 'radians'."
-            )
-        fig, ax = self.obstacle_course.plot(
+        return self.obstacle_course.plot_path(
+            self.start,
+            self.end,
+            distance_path=self.distance_path,
+            angle_path=self.angle_path,
             ax=ax,
             show_vertices=show_vertices,
             show_labels=show_labels,
             title=title,
-            show=False,
+            show=show,
+            length_units=length_units,
+            angle_units=angle_units
         )
 
-        ax.scatter(
-            self.start[0],
-            self.start[1],
-            s=80,
-            marker="o",
-            color="green",
-            label="start",
-            clip_on=False,
-            zorder=5,
-        )
-        ax.scatter(
-            self.end[0],
-            self.end[1],
-            s=120,
-            marker="*",
-            color="purple",
-            label="target",
-            clip_on=False,
-            zorder=5,
-        )
-
-        if self.distance_path is not None:
-            distance_coords = np.asarray(
-                self.distance_path.coords,
-                dtype=float,
-            )
-            distance_length, distance_angle_radians = path_metrics(
-                self.distance_path
-            )
-            distance_angle_display = (
-                distance_angle_radians * angle_scale
-            )
-            # The recursive model depends on where each bend sits along
-            # the path, not just the totals, so the pressure is evaluated
-            # from the path geometry rather than from (length, angle).
-            distance_pressure = path_pressure(
-                self.distance_path,
-                length_units=normalized_length_units,
-            )
-
-            ax.plot(
-                distance_coords[:, 0],
-                distance_coords[:, 1],
-                linewidth=2.5,
-                color="tab:red",
-                label=(
-                    "min distance "
-                    f"(length={distance_length:.2f} {normalized_length_units}, "
-                    f"angle={distance_angle_display:.2f} {angle_label}, "
-                    f"pressure={distance_pressure:.3f} psi)"
-                ),
-                zorder=4,
-            )
-
-        if self.angle_path is not None:
-            angle_coords = np.asarray(
-                self.angle_path.coords,
-                dtype=float,
-            )
-            angle_length, measured_angle_radians = path_metrics(
-                self.angle_path
-            )
-            angle_cost_radians = (
-                measured_angle_radians
-                if self.total_angle is None
-                else self.total_angle
-            )
-            angle_cost_display = angle_cost_radians * angle_scale
-            angle_pressure = path_pressure(
-                self.angle_path,
-                length_units=normalized_length_units,
-            )
-
-            ax.plot(
-                angle_coords[:, 0],
-                angle_coords[:, 1],
-                linewidth=2.5,
-                linestyle="--",
-                color="tab:orange",
-                label=(
-                    "min angle "
-                    f"(length={angle_length:.2f} {normalized_length_units}, "
-                    f"angle={angle_cost_display:.2f} {angle_label}, "
-                    f"pressure={angle_pressure:.3f} psi)"
-                ),
-                zorder=4,
-            )
-
-        ax.legend()
-
-        if show:
-            plt.show()
-
-        return fig, ax
