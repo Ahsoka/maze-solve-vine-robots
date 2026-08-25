@@ -12,77 +12,73 @@ from .constants import (
     _LENGTH_TO_FEET
 )
 
-def vine_robot_pressure(
-    length: float,
-    angles: float | list[float] | np.ndarray,
-    *,
-    length_units: str = "ft",
-    angle_units: str = "degrees",
-) -> float:
-    """
-    Compute the vine-robot driving pressure in psi.
+# ------------------------------------------------------------------
+# Pressure model
+# ------------------------------------------------------------------
+#
+# Recursive (nested capstan) growth pressure. For a path of n segments
+# with lengths l_1 ... l_n and n - 1 interior turning angles t_1 ... t_{n-1}:
+#
+#     tau_0 = T
+#     tau_i = (tau_{i-1} + f * l_i) * exp(mu_c * |t_i|)      i = 1 ... n-1
+#     P     = Y + tau_{n-1} + f * l_n
+#
+# Each segment's drag is amplified only by the bends *distal* to it, i.e.
+# the bends its accumulated tension must still be dragged through on the
+# way to the tip. The terminal segment has nothing distal to it and is
+# therefore charged at face value.
+#
+# This replaces the summed form P = Y + (f * L + T) * exp(mu_c * sum|t_i|),
+# which charges every segment for every bend and is a strict upper bound.
+# ------------------------------------------------------------------
 
-    Parameters
-    ----------
-    length:
-        Vine-robot path length in ``length_units``.
-    angles:
-        One turning angle or a collection of turning angles.
-    length_units:
-        Units used for ``length``. Supported values are ``"ft"``,
-        ``"in"``, ``"m"``, and ``"cm"``.
-    angle_units:
-        Units used for ``angles``: ``"degrees"`` or ``"radians"``.
+_DEGREE_ALIASES = {"degree", "degrees", "deg"}
+_RADIAN_ALIASES = {"radian", "radians", "rad"}
 
-    Returns
-    -------
-    float
-        Required pressure in psi.
-    """
-    if length < 0:
-        raise ValueError("length must be nonnegative.")
 
-    normalized_length_units = length_units.lower()
-    if normalized_length_units not in _LENGTH_TO_FEET:
+def _to_radians(angles, angle_units: str) -> np.ndarray:
+    angle_array = np.atleast_1d(
+        np.asarray(angles, dtype=float)
+    ).ravel()
+
+    normalized = angle_units.lower()
+
+    if normalized in _DEGREE_ALIASES:
+        return np.deg2rad(angle_array)
+
+    if normalized in _RADIAN_ALIASES:
+        return angle_array
+
+    raise ValueError("angle_units must be 'degrees' or 'radians'.")
+
+
+def _length_scale(length_units: str) -> float:
+    normalized = length_units.lower()
+
+    if normalized not in _LENGTH_TO_FEET:
         raise ValueError(
             "length_units must be one of: 'ft', 'in', 'm', or 'cm'."
         )
 
-    angle_array = np.asarray(angles, dtype=float)
-    normalized_angle_units = angle_units.lower()
+    return _LENGTH_TO_FEET[normalized]
 
-    if normalized_angle_units in {"degree", "degrees", "deg"}:
-        angles_radians = np.deg2rad(angle_array)
-    elif normalized_angle_units in {"radian", "radians", "rad"}:
-        angles_radians = angle_array
-    else:
-        raise ValueError(
-            "angle_units must be 'degrees' or 'radians'."
-        )
 
-    length_ft = float(length) * _LENGTH_TO_FEET[normalized_length_units]
-    cumulative_angle_radians = float(np.sum(angles_radians))
+def segment_geometry(path) -> tuple[np.ndarray, np.ndarray]:
+    """Return per-segment lengths and per-vertex turning angles.
 
-    return float(
-        YIELD_PRESSURE_PSI
-        + (
-            LENGTH_FRICTION_PSI_PER_FT * length_ft
-            + TAIL_TENSION_PSI
-        )
-        * np.exp(
-            CURVATURE_FRICTION_COEFFICIENT
-            * cumulative_angle_radians
-        )
+    Accepts a ``LineString`` or any ``(n + 1, d)`` array of vertices, in
+    two or three dimensions. Consecutive duplicate vertices are dropped.
+    Turning angles are unsigned and reported in radians; there is one
+    per interior vertex, so ``len(angles) == len(lengths) - 1``.
+    """
+    coords = np.asarray(
+        path.coords if hasattr(path, "coords") else path,
+        dtype=float,
     )
 
-def path_metrics(path: LineString) -> tuple[float, float]:
-    """Return path length and cumulative unsigned turning angle."""
-    coords = np.asarray(path.coords, dtype=float)
+    if coords.ndim != 2 or len(coords) < 2:
+        return np.zeros(0), np.zeros(0)
 
-    if len(coords) < 2:
-        return 0.0, 0.0
-
-    # Remove consecutive duplicate coordinates before computing turns.
     keep = np.concatenate((
         [True],
         np.any(np.diff(coords, axis=0) != 0.0, axis=1),
@@ -90,59 +86,185 @@ def path_metrics(path: LineString) -> tuple[float, float]:
     coords = coords[keep]
 
     if len(coords) < 2:
-        return 0.0, 0.0
+        return np.zeros(0), np.zeros(0)
 
     vectors = np.diff(coords, axis=0)
-    path_length = float(np.linalg.norm(vectors, axis=1).sum())
+    lengths = np.linalg.norm(vectors, axis=1)
 
     if len(vectors) < 2:
-        return path_length, 0.0
+        return lengths, np.zeros(0)
 
     incoming = vectors[:-1]
     outgoing = vectors[1:]
-
-    denominators = (
-        np.linalg.norm(incoming, axis=1)
-        * np.linalg.norm(outgoing, axis=1)
-    )
 
     cosine_angles = np.einsum(
         "ij,ij->i",
         incoming,
         outgoing,
-    ) / denominators
+    ) / (
+        lengths[:-1] * lengths[1:]
+    )
 
-    turning_angles = np.arccos(
+    angles = np.arccos(
         np.clip(cosine_angles, -1.0, 1.0)
     )
 
-    return path_length, float(turning_angles.sum())
+    return lengths, angles
+
+
+def vine_robot_pressure(
+    segment_lengths,
+    angles,
+    *,
+    length_units: str = "ft",
+    angle_units: str = "degrees",
+    yield_pressure: float = YIELD_PRESSURE_PSI,
+    length_friction: float = LENGTH_FRICTION_PSI_PER_FT,
+    tail_tension: float = TAIL_TENSION_PSI,
+    curvature_coefficient: float = CURVATURE_FRICTION_COEFFICIENT,
+) -> float:
+    """
+    Compute the vine-robot driving pressure in psi (recursive capstan model).
+
+    Parameters
+    ----------
+    segment_lengths:
+        Per-segment lengths in ``length_units``, ordered base to tip. A
+        bare float is accepted for a single straight segment.
+    angles:
+        Turning angles at the interior vertices, one per vertex, so
+        ``len(angles) == len(segment_lengths) - 1``. Signs are ignored.
+    length_units:
+        Units used for ``segment_lengths``: ``"ft"``, ``"in"``, ``"m"``,
+        or ``"cm"``.
+    angle_units:
+        Units used for ``angles``: ``"degrees"`` or ``"radians"``.
+    yield_pressure, length_friction, tail_tension, curvature_coefficient:
+        Model parameters, defaulting to the fitted values in
+        ``constants``. ``length_friction`` is psi per foot regardless of
+        ``length_units``.
+
+    Returns
+    -------
+    float
+        Required pressure in psi.
+
+    Notes
+    -----
+    This function needs the *interleaving* of lengths and bends, not just
+    the totals, so it deliberately rejects the old ``(total_length,
+    total_angle)`` call signature rather than silently reinterpreting it.
+    """
+    lengths = np.atleast_1d(
+        np.asarray(segment_lengths, dtype=float)
+    ).ravel()
+
+    turning_angles = np.abs(
+        _to_radians(angles, angle_units)
+    )
+
+    if lengths.size == 0:
+        raise ValueError(
+            "segment_lengths must contain at least one segment."
+        )
+
+    if np.any(lengths < 0.0):
+        raise ValueError("Segment lengths must be nonnegative.")
+
+    if turning_angles.size != lengths.size - 1:
+        raise ValueError(
+            "Expected one turning angle per interior vertex: "
+            f"len(angles) == len(segment_lengths) - 1 == "
+            f"{lengths.size - 1}, got {turning_angles.size}. The "
+            "recursive pressure model needs per-segment lengths, not a "
+            "single total length."
+        )
+
+    if curvature_coefficient < 0.0:
+        raise ValueError("curvature_coefficient must be nonnegative.")
+
+    lengths_ft = lengths * _length_scale(length_units)
+    drag = length_friction * lengths_ft
+    amplification = np.exp(curvature_coefficient * turning_angles)
+
+    # tau_i = (tau_{i-1} + f * l_i) * exp(mu_c * |t_i|), then the
+    # terminal segment is added without amplification.
+    tension = float(tail_tension)
+
+    for segment_drag, factor in zip(drag[:-1], amplification):
+        tension = (tension + segment_drag) * factor
+
+    tension += drag[-1]
+
+    return float(yield_pressure + tension)
+
+
+def path_pressure(
+    path,
+    *,
+    length_units: str = "ft",
+    **model_parameters,
+) -> float:
+    """Growth pressure of a ``LineString`` or vertex array, in psi."""
+    lengths, angles = segment_geometry(path)
+
+    if lengths.size == 0:
+        raise ValueError(
+            "A pressure requires a path with at least two distinct points."
+        )
+
+    return vine_robot_pressure(
+        lengths,
+        angles,
+        length_units=length_units,
+        angle_units="radians",
+        **model_parameters,
+    )
+
+
+def path_metrics(path: LineString) -> tuple[float, float]:
+    """Return path length and cumulative unsigned turning angle.
+
+    Retained for reporting. The cumulative angle is no longer sufficient
+    to determine pressure under the recursive model, which depends on
+    where each bend sits along the path.
+    """
+    lengths, angles = segment_geometry(path)
+
+    return float(lengths.sum()), float(angles.sum())
+
 
 def pressure_profile(
     path: LineString,
     *,
     length_units: str = "ft",
     points_per_segment: int = 50,
+    yield_pressure: float = YIELD_PRESSURE_PSI,
+    length_friction: float = LENGTH_FRICTION_PSI_PER_FT,
+    tail_tension: float = TAIL_TENSION_PSI,
+    curvature_coefficient: float = CURVATURE_FRICTION_COEFFICIENT,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return cumulative path length and required pressure samples.
 
-    Pressure increases linearly with deployed length along each straight
-    segment. At every interior path vertex, the accumulated turning angle
-    changes instantaneously, so the returned profile contains two pressure
-    values at that same cumulative length to display the resulting jump.
+    The profile is the pressure history of the deployment: the value at
+    arclength ``s`` is the pressure required when the tip has reached
+    ``s``, which is the recursion applied to the path truncated there.
+
+    Under the recursive model the tip is always distal to every bend, so
+    freshly deployed body adds drag at the constant rate ``f`` and the
+    profile rises linearly within each segment. Rounding a vertex
+    multiplies the accumulated tension by ``exp(mu_c * |t|)``, so the
+    profile contains two pressure values at that same cumulative length
+    to display the resulting jump. (Under the old summed model the slope
+    itself grew after every turn; here it does not.)
     """
-    normalized_length_units = length_units.lower()
-    if normalized_length_units not in _LENGTH_TO_FEET:
-        raise ValueError(
-            "length_units must be one of: 'ft', 'in', 'm', or 'cm'."
-        )
+    length_to_feet = _length_scale(length_units)
 
     if not isinstance(points_per_segment, int) or points_per_segment < 1:
         raise ValueError("points_per_segment must be a positive integer.")
 
     coords = np.asarray(path.coords, dtype=float)
 
-    # Remove consecutive duplicates so every segment has positive length.
     if len(coords) > 1:
         keep = np.concatenate((
             [True],
@@ -156,60 +278,31 @@ def pressure_profile(
             "distinct points."
         )
 
-    segment_vectors = np.diff(coords, axis=0)
-    segment_lengths = np.linalg.norm(segment_vectors, axis=1)
+    segment_lengths, turning_angles = segment_geometry(coords)
 
     if np.any(segment_lengths == 0.0):
         raise ValueError(
             "A pressure profile cannot contain zero-length segments."
         )
 
-    if len(segment_vectors) > 1:
-        incoming = segment_vectors[:-1]
-        outgoing = segment_vectors[1:]
-
-        cosine_angles = np.einsum(
-            "ij,ij->i",
-            incoming,
-            outgoing,
-        ) / (
-            segment_lengths[:-1] * segment_lengths[1:]
-        )
-
-        turning_angles = np.arccos(
-            np.clip(cosine_angles, -1.0, 1.0)
-        )
-    else:
-        turning_angles = np.empty(0, dtype=float)
-
-    length_to_feet = _LENGTH_TO_FEET[normalized_length_units]
     cumulative_length = 0.0
-    cumulative_angle = 0.0
+    tension = float(tail_tension)
 
     profile_lengths = []
     profile_pressures = []
 
     for segment_index, segment_length in enumerate(segment_lengths):
         if segment_index > 0:
-            # The previous segment already contributed the pressure just
-            # before this turn. Add the post-turn pressure at the same
-            # cumulative length to create the vertical jump in the plot.
-            cumulative_angle += turning_angles[segment_index - 1]
-            post_turn_pressure = (
-                YIELD_PRESSURE_PSI
-                + (
-                    LENGTH_FRICTION_PSI_PER_FT
-                    * cumulative_length
-                    * length_to_feet
-                    + TAIL_TENSION_PSI
-                )
-                * np.exp(
-                    CURVATURE_FRICTION_COEFFICIENT
-                    * cumulative_angle
-                )
+            # Everything deployed so far is now proximal to this bend, so
+            # the whole accumulated tension is amplified at once. The
+            # previous segment already contributed the pre-turn pressure
+            # at this cumulative length.
+            tension *= np.exp(
+                curvature_coefficient
+                * turning_angles[segment_index - 1]
             )
             profile_lengths.append(cumulative_length)
-            profile_pressures.append(post_turn_pressure)
+            profile_pressures.append(yield_pressure + tension)
 
         local_lengths = np.linspace(
             0.0,
@@ -223,21 +316,15 @@ def pressure_profile(
 
         sampled_lengths = cumulative_length + local_lengths
         sampled_pressures = (
-            YIELD_PRESSURE_PSI
-            + (
-                LENGTH_FRICTION_PSI_PER_FT
-                * sampled_lengths
-                * length_to_feet
-                + TAIL_TENSION_PSI
-            )
-            * np.exp(
-                CURVATURE_FRICTION_COEFFICIENT
-                * cumulative_angle
-            )
+            yield_pressure
+            + tension
+            + length_friction * local_lengths * length_to_feet
         )
 
         profile_lengths.extend(sampled_lengths.tolist())
         profile_pressures.extend(sampled_pressures.tolist())
+
+        tension += length_friction * segment_length * length_to_feet
         cumulative_length += segment_length
 
     return (

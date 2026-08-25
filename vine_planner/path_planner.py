@@ -9,9 +9,9 @@ from .constants import _LENGTH_TO_FEET
 from shapely import Point, LineString
 from .obstacle_course import ObstacleCourse
 from .utils import (
-    vine_robot_pressure,
     pressure_profile,
-    path_metrics,
+    path_pressure,
+    path_metrics
 )
 
 
@@ -411,6 +411,7 @@ class PathPlanner:
         ax: plt.Axes = None,
         *,
         length_units: str = "ft",
+        angle_units: str = "degrees",
         points_per_segment: int = 50,
         title: str = None,
         show: bool = True,
@@ -419,6 +420,11 @@ class PathPlanner:
 
         Any computed distance and angle paths are plotted on the same axes.
         Raises ``RuntimeError`` when neither path has been computed.
+
+        Cumulative turning is reported in the legend for reference. It no
+        longer determines the pressure on its own: two paths with equal
+        length and equal total turning can end at different pressures
+        depending on where along the path the bends fall.
         """
         if self.distance_path is None and self.angle_path is None:
             raise RuntimeError(
@@ -432,12 +438,29 @@ class PathPlanner:
                 "length_units must be one of: 'ft', 'in', 'm', or 'cm'."
             )
 
+        normalized_angle_units = angle_units.lower()
+        if normalized_angle_units in {"degree", "degrees", "deg"}:
+            angle_scale = 180.0 / np.pi
+            angle_label = "deg"
+        elif normalized_angle_units in {"radian", "radians", "rad"}:
+            angle_scale = 1.0
+            angle_label = "rad"
+        else:
+            raise ValueError(
+                "angle_units must be 'degrees' or 'radians'."
+            )
+
         if ax is None:
             fig, ax = plt.subplots(figsize=(8, 6))
         else:
             fig = ax.figure
 
         if self.distance_path is not None:
+            _, distance_angle_radians = path_metrics(self.distance_path)
+            distance_angle_display = (
+                distance_angle_radians * angle_scale
+            )
+
             lengths, pressures = pressure_profile(
                 self.distance_path,
                 length_units=normalized_length_units,
@@ -451,11 +474,20 @@ class PathPlanner:
                 label=(
                     "min distance "
                     f"(length={lengths[-1]:.2f} {normalized_length_units}, "
+                    f"angle={distance_angle_display:.2f} {angle_label}, "
                     f"final pressure={pressures[-1]:.3f} psi)"
                 ),
             )
 
         if self.angle_path is not None:
+            _, measured_angle_radians = path_metrics(self.angle_path)
+            angle_cost_radians = (
+                measured_angle_radians
+                if self.total_angle is None
+                else self.total_angle
+            )
+            angle_cost_display = angle_cost_radians * angle_scale
+
             lengths, pressures = pressure_profile(
                 self.angle_path,
                 length_units=normalized_length_units,
@@ -470,6 +502,7 @@ class PathPlanner:
                 label=(
                     "min angle "
                     f"(length={lengths[-1]:.2f} {normalized_length_units}, "
+                    f"angle={angle_cost_display:.2f} {angle_label}, "
                     f"final pressure={pressures[-1]:.3f} psi)"
                 ),
             )
@@ -558,11 +591,12 @@ class PathPlanner:
             distance_angle_display = (
                 distance_angle_radians * angle_scale
             )
-            distance_pressure = vine_robot_pressure(
-                distance_length,
-                distance_angle_radians,
+            # The recursive model depends on where each bend sits along
+            # the path, not just the totals, so the pressure is evaluated
+            # from the path geometry rather than from (length, angle).
+            distance_pressure = path_pressure(
+                self.distance_path,
                 length_units=normalized_length_units,
-                angle_units="radians",
             )
 
             ax.plot(
@@ -593,11 +627,9 @@ class PathPlanner:
                 else self.total_angle
             )
             angle_cost_display = angle_cost_radians * angle_scale
-            angle_pressure = vine_robot_pressure(
-                angle_length,
-                angle_cost_radians,
+            angle_pressure = path_pressure(
+                self.angle_path,
                 length_units=normalized_length_units,
-                angle_units="radians",
             )
 
             ax.plot(
