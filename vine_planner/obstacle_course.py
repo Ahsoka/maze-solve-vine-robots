@@ -34,7 +34,88 @@ class ObstacleCourse:
         self.obstacles_region = shapely.union_all(self.obstacles)
         shapely.prepare(self.obstacles_region)
 
-    def vaild_goal(self, coords):
+    @property
+    def dimension(self) -> int:
+        """Number of coordinates a point in this course carries."""
+        return 2
+
+    def generate_goals(self, start=None, end=None):
+        """Fill in whichever of ``start``/``end`` was not supplied.
+
+        Returns the pair with maximum straight-line separation inside the free
+        region: the farthest pair when both are missing, and the farthest
+        valid point from the one that was given otherwise.
+
+        ``PathPlanner`` calls this without knowing which course it holds, so
+        every course class owns its own goal placement.
+        """
+        if start is not None and end is not None:
+            return np.asarray(start, dtype=float), np.asarray(end, dtype=float)
+
+        course_region = shapely.box(0.0, 0.0, self.width, self.height)
+
+        if self.obstacles:
+            valid_region = shapely.difference(
+                course_region,
+                self.obstacles_region,
+            )
+        else:
+            valid_region = course_region
+
+        if valid_region.is_empty or valid_region.area <= 0:
+            raise RuntimeError(
+                "The obstacle course has no valid area for start "
+                "and end points."
+            )
+
+        # The farthest pair of points in a polygonal region can be found
+        # among the vertices of its convex hull.
+        convex_hull = valid_region.convex_hull
+
+        if convex_hull.geom_type != "Polygon":
+            raise RuntimeError(
+                "The valid region does not contain enough area to "
+                "generate distinct start and end points."
+            )
+
+        # The final exterior coordinate repeats the first coordinate,
+        # so remove it.
+        candidates = np.asarray(
+            convex_hull.exterior.coords,
+            dtype=float,
+        )[:-1, :2]
+
+        if len(candidates) < 2:
+            raise RuntimeError(
+                "Not enough valid candidate points were found."
+            )
+
+        if start is None and end is None:
+            # Squared distance is enough, since sqrt() does not change which
+            # pair is largest.
+            differences = (
+                candidates[:, np.newaxis, :] - candidates[np.newaxis, :, :]
+            )
+
+            squared_distances = np.sum(differences**2, axis=2)
+
+            start_index, end_index = np.unravel_index(
+                np.argmax(squared_distances),
+                squared_distances.shape,
+            )
+
+            return candidates[start_index].copy(), candidates[end_index].copy()
+
+        if start is None:
+            fixed = np.asarray(end, dtype=float)
+            squared_distances = np.sum((candidates - fixed) ** 2, axis=1)
+            return candidates[np.argmax(squared_distances)].copy(), fixed
+
+        fixed = np.asarray(start, dtype=float)
+        squared_distances = np.sum((candidates - fixed) ** 2, axis=1)
+        return fixed, candidates[np.argmax(squared_distances)].copy()
+
+    def valid_goal(self, coords):
         """
         Check if a point is a valid start or end point.
         Ff the point is in the obstacle course and the point
@@ -648,7 +729,6 @@ class ObstacleCourse:
             obstacles=polygons,
         )
 
-    @property
     def vertices(self):
         vertices = []
         for point in itertools.chain.from_iterable(
@@ -846,7 +926,1038 @@ class ObstacleCourse:
 
         ax.legend()
 
-        if show:
-            plt.show()
 
-        return fig, ax
+# ---------------------------------------------------------------------------
+# Voxel-lattice obstacle course
+# ---------------------------------------------------------------------------
+# Face indexing.  The four side faces run counterclockwise about +z starting
+# at +x; the bottom and top come last:
+#
+#     0 -> +x        3 -> -y
+#     1 -> +y        4 -> -z   (bottom)
+#     2 -> -x        5 -> +z   (top)
+#
+# An obstacle is the tuple (i, j, k, f): voxel (i, j, k) of the lattice, face
+# f of that voxel.  Voxel (i, j, k) occupies
+#     [i*s, (i+1)*s] x [j*s, (j+1)*s] x [k*s, (k+1)*s],  s = voxel_size,
+# and face f is that voxel's boundary square.
+#
+# Solid model
+# -----------
+# A wall is a *box*, not a quad: ``thickness`` deep along its own normal into
+# the interior of the voxel that owns it, and grown by ``dilation`` in its own
+# plane.  The dilation is what makes the model work.  Testing a segment
+# against each wall separately is only sound when
+#
+#     int(union of the walls) == union of int(each wall),
+#
+# and with flat quads every interior is empty, so the identity fails
+# everywhere: two walls that merely touch leave a seam that lies on the
+# boundary of both, and a segment through it grazes each one and is reported
+# clear by both.  Growing every wall by the same ``dilation`` turns every
+# contact -- coplanar edge to edge, coplanar corner to corner, perpendicular
+# along an edge, and perpendicular at a single point -- into an overlap with
+# positive volume, which restores the identity.  A segment through any former
+# seam now enters the interior of at least one box and is caught.
+#
+# Only the outermost walls of the course extend past its boundary, and only by
+# ``dilation``; vertices that land outside are dropped, since nothing can
+# reach them.
+
+_FACE_AXIS = (0, 1, 0, 1, 2, 2)
+_FACE_SIGN = (1, 1, -1, -1, -1, 1)
+_FACE_NAMES = ("+x", "+y", "-x", "-y", "-z", "+z")
+
+# Face code of the negative / positive face of a voxel, indexed by axis.
+_NEGATIVE_FACE = (2, 3, 4)      # -x, -y, -z
+_POSITIVE_FACE = (0, 1, 5)      # +x, +y, +z
+
+# The two in-plane axes of a wall, indexed by the axis it is perpendicular to.
+_AXIS_PAIRS = ((1, 2), (0, 2), (0, 1))
+
+
+@define
+class ObstacleCourseVoxels:
+    width: float = field(default=18.0, converter=float, validator=[validators.instance_of(float), validators.gt(0)])
+    height: float = field(default=18.0, converter=float, validator=[validators.instance_of(float), validators.gt(0)])
+    depth: float = field(default=36.0, converter=float, validator=[validators.instance_of(float), validators.gt(0)])
+
+    voxel_size: float = field(default=6.0, converter=float, validator=[validators.instance_of(float), validators.gt(0)])
+
+    # Depth of a wall along its own normal, and how far it is grown in its own
+    # plane.  Both default to 1% of a voxel: large enough to sit far above any
+    # floating point tolerance, small enough not to distort the lattice.
+    thickness: float | None = field(default=None)
+    dilation: float | None = field(default=None)
+
+    obstacles: list[tuple[int, int, int, int]] = field(factory=list)
+
+    # Solid model, built once: (n, 3) lower and upper corners of every wall.
+    box_low: np.ndarray = field(init=False, default=None)
+    box_high: np.ndarray = field(init=False, default=None)
+
+    @voxel_size.validator
+    def _voxel_valid(self, attribute, value):
+        # A validator has to *raise*; returning False is silently ignored by
+        # attrs.  Float modulo is also unsafe here (0.3 % 0.1 != 0), so the
+        # divisibility check is done on the rounded voxel count instead.
+        for name in ("width", "height", "depth"):
+            extent = getattr(self, name)
+            count = round(extent / value)
+            if count < 1 or abs(count * value - extent) > 1e-9 * max(extent, value):
+                raise ValueError(
+                    f"{name}={extent} is not a whole number of voxels of "
+                    f"size {value}."
+                )
+
+    def __attrs_post_init__(self):
+        # Neighbouring voxels share a wall, so two different (voxel, face)
+        # tuples can name the same slab. Rejecting that here makes uniqueness
+        # a property of the class rather than of one constructor.
+        keys = [self.wall_key(*obstacle) for obstacle in self.obstacles]
+
+        if len(set(keys)) != len(keys):
+            duplicates = {key for key in keys if keys.count(key) > 1}
+            raise ValueError(
+                f"obstacles contains {len(keys) - len(set(keys))} duplicate "
+                f"wall(s); offending wall keys: {sorted(duplicates)}."
+            )
+
+        if self.thickness is None:
+            self.thickness = 0.01 * self.voxel_size
+
+        if self.dilation is None:
+            self.dilation = 0.01 * self.voxel_size
+
+        for name in ("thickness", "dilation"):
+            value = float(getattr(self, name))
+            if not 0.0 < value < 0.5 * self.voxel_size:
+                raise ValueError(
+                    f"{name}={value} must lie in (0, voxel_size/2); above that "
+                    "walls a whole voxel apart would merge."
+                )
+            setattr(self, name, value)
+
+        bounds = [self.wall_bounds(*obstacle) for obstacle in self.obstacles]
+
+        self.box_low = (
+            np.array([low for low, _ in bounds], dtype=float)
+            if bounds else np.zeros((0, 3))
+        )
+        self.box_high = (
+            np.array([high for _, high in bounds], dtype=float)
+            if bounds else np.zeros((0, 3))
+        )
+
+    # ------------------------------------------------------------------ #
+    # Solid model
+    # ------------------------------------------------------------------ #
+    def wall_bounds(self, i: int, j: int, k: int, face: int):
+        """``(low, high)`` corners of the solid box for one blocked wall.
+
+        The box depends on the *wall*, never on which of the two neighbouring
+        voxels was used to name it: the face is resolved to its canonical
+        representative first.  Without that, the same plane could be thickened
+        in opposite directions by two differently written obstacles, and two
+        coplanar neighbours would meet in a zero-volume seam again.
+        """
+        cell = self.wall_key(i, j, k, face)
+        axis = cell[3]
+
+        canonical = self._wall_to_voxel_face(self.shape, axis, cell[:3])
+        face = canonical[3]
+
+        size = self.voxel_size
+        corner = np.array(canonical[:3], dtype=float) * size
+
+        plane = corner[axis] + size if _FACE_SIGN[face] > 0 else corner[axis]
+
+        low = np.empty(3, dtype=float)
+        high = np.empty(3, dtype=float)
+
+        # Grow along the normal *into* the voxel that owns the face.
+        if _FACE_SIGN[face] > 0:
+            low[axis], high[axis] = plane - self.thickness, plane
+        else:
+            low[axis], high[axis] = plane, plane + self.thickness
+
+        for in_plane_axis in _AXIS_PAIRS[axis]:
+            low[in_plane_axis] = corner[in_plane_axis] - self.dilation
+            high[in_plane_axis] = corner[in_plane_axis] + size + self.dilation
+
+        return low, high
+
+    @property
+    def extent(self) -> np.ndarray:
+        return np.array((self.width, self.height, self.depth), dtype=float)
+
+    def inside_walls(self, points: np.ndarray, tol: float = 1e-9) -> np.ndarray:
+        """``(n,)`` bool: is each point strictly inside some wall?
+
+        Contact with a wall surface is not "inside": a path is allowed to hug
+        a wall, so only points that have penetrated one are rejected.
+        """
+        points = np.atleast_2d(np.asarray(points, dtype=float))
+
+        if len(self.box_low) == 0:
+            return np.zeros(len(points), dtype=bool)
+
+        return (
+            np.all(points[:, None, :] > self.box_low[None] + tol, axis=2)
+            & np.all(points[:, None, :] < self.box_high[None] - tol, axis=2)
+        ).any(axis=1)
+
+    # ------------------------------------------------------------------ #
+    # Planner interface
+    # ------------------------------------------------------------------ #
+    @property
+    def dimension(self) -> int:
+        """Number of coordinates a point in this course carries."""
+        return 3
+
+    def generate_goals(self, start=None, end=None):
+        """Fill in whichever of ``start``/``end`` was not supplied.
+
+        Opposite corners of the course box: the origin and
+        ``(width, height, depth)``. Both lie on the boundary of the box, and a
+        wall only ever touches a corner rather than covering it, so neither
+        can be sealed in.
+        """
+        corners = (np.zeros(3, dtype=float), self.extent.copy())
+
+        resolved = []
+
+        for point, default in zip((start, end), corners):
+            if point is None:
+                if not self.valid_goal(default):
+                    raise RuntimeError(
+                        f"The default goal {tuple(default)} is inside a wall; "
+                        "pass start/end explicitly."
+                    )
+                resolved.append(default)
+            else:
+                resolved.append(np.asarray(point, dtype=float))
+
+        return resolved[0], resolved[1]
+
+    def valid_goal(self, coords, tol: float = 1e-9) -> bool:
+        """Is ``coords`` a legal start or end point?
+
+        Legal means inside the closed course box and not buried in a wall.
+        A point resting on a wall surface stays legal, matching
+        :meth:`is_visible`, which treats surface contact as a graze.
+        """
+        point = np.asarray(coords, dtype=float)
+
+        if point.shape != (3,):
+            raise ValueError(
+                f"a goal must contain exactly three coordinates, got {point.shape}."
+            )
+
+        if np.any(point < -tol) or np.any(point > self.extent + tol):
+            return False
+
+        return not bool(self.inside_walls(point[None, :], tol)[0])
+
+    @staticmethod
+    def _box_edges() -> list[tuple[int, int]]:
+        """The twelve edges of a box, as pairs of corner indices.
+
+        Bit ``b`` of a corner index selects the high side of axis ``b``, so two
+        corners are joined by an edge exactly when their indices differ in one
+        bit.
+        """
+        return [
+            (corner, corner | (1 << axis))
+            for corner in range(8)
+            for axis in range(3)
+            if not corner & (1 << axis)
+        ]
+
+    def box_corners(self) -> np.ndarray:
+        """``(n, 8, 3)`` corners of every wall box."""
+        if len(self.box_low) == 0:
+            return np.zeros((0, 8, 3))
+
+        mask = ((np.arange(8)[:, None] >> np.arange(3)) & 1).astype(bool)
+
+        return np.where(
+            mask[None, :, :],
+            self.box_high[:, None, :],
+            self.box_low[:, None, :],
+        )
+
+    def uniform_discretization(
+        self,
+        start: np.ndarray,
+        end: np.ndarray,
+        spacing: float | None = None,
+    ) -> np.ndarray:
+        """Evenly spaced points along one edge, endpoints included.
+
+        The count follows the edge's *length*, not the edge itself, so a long
+        edge is sampled more finely than a short one and every sample sits
+        roughly ``spacing`` apart. That matters here because a wall box is very
+        anisotropic: its two in-plane edges span a voxel while the four along
+        its normal span only ``thickness``, and a fixed count per edge would
+        pile up redundant nodes across that sliver.
+
+        ``spacing`` defaults to half a voxel. To vary it without changing the
+        interface, bind it first::
+
+            from functools import partial
+            course.vertices(partial(course.uniform_discretization, spacing=1.0))
+        """
+        start = np.asarray(start, dtype=float)
+        end = np.asarray(end, dtype=float)
+
+        if spacing is None:
+            spacing = 0.5 * self.voxel_size
+
+        if spacing <= 0.0:
+            raise ValueError(f"spacing must be positive, got {spacing}.")
+
+        length = float(np.linalg.norm(end - start))
+
+        # At least one interval, so the endpoints always come back.
+        intervals = max(1, int(round(length / spacing)))
+
+        fractions = np.linspace(0.0, 1.0, intervals + 1)[:, None]
+
+        return start[None, :] + fractions * (end - start)[None, :]
+
+    def vertices(self, discretization=None) -> list[tuple[float, float, float]]:
+        """Every point that should become a node of the visibility graph.
+
+        That is the corners of the wall boxes plus samples along their edges,
+        since an optimal path in a polyhedral scene bends on edges, not only at
+        corners. ``discretization`` is a callable ``(start, end) -> (m, 3)``
+        returning the samples along one edge; it defaults to
+        :meth:`uniform_discretization`.
+
+        A point is kept only when it lies inside the course and is not buried
+        inside another wall. Burying matters because a node inside a wall would
+        let a path cross that wall in two hops, each of which merely touches
+        its surface and so grazes legally on its own.
+        """
+        if len(self.box_low) == 0:
+            return []
+
+        if discretization is None:
+            discretization = self.uniform_discretization
+
+        corners = self.box_corners()
+
+        samples = [corners.reshape(-1, 3)]
+
+        for box in corners:
+            for first, second in self._box_edges():
+                samples.append(
+                    np.asarray(discretization(box[first], box[second]), dtype=float)
+                )
+
+        points = np.vstack(samples)
+
+        # Corners are shared by three edges of their own box, and neighbouring
+        # boxes overlap, so the same coordinate is produced many times.
+        _, keep = np.unique(np.round(points, 9), axis=0, return_index=True)
+        points = points[np.sort(keep)]
+
+        # Dilation pushes the outermost walls a little past the course; those
+        # points are unreachable, so they are dropped rather than planned to.
+        inside_course = np.all(points >= -1e-9, axis=1) & np.all(
+            points <= self.extent + 1e-9, axis=1
+        )
+
+        points = points[inside_course & ~self.inside_walls(points)]
+
+        return [tuple(map(float, point)) for point in points]
+
+    def is_visible(self, vertex1, vertex2, tol: float = 1e-9) -> bool:
+        """Is the open segment between the two points free of every wall?
+
+        Each box is clipped independently, which the dilation makes sound (see
+        the note at the top of the file).  Writing the segment as
+        ``x(t) = p + t (q - p)`` and the box as ``lo <= x <= hi``, the six face
+        distances are ``x - hi`` and ``lo - x``, each affine in ``t``, so
+
+            g(t) = max over the six faces
+
+        is convex and piecewise linear.  Clipping gives ``[t0, t1]``, the whole
+        of the segment that meets the closed box, and ``g`` vanishes at both
+        ends of it.  Convexity then leaves exactly two possibilities: ``g`` is
+        identically zero across the interval, meaning the segment only skims
+        the surface, or it is strictly negative throughout, meaning the segment
+        passes through.  Probing the middle separates them, so one evaluation
+        per box decides it.
+
+        A skim stays visible on purpose: a path is allowed to hug a wall, and
+        the minimum-pressure path usually wants to.
+        """
+        start = np.asarray(vertex1, dtype=float)
+        end = np.asarray(vertex2, dtype=float)
+
+        if len(self.box_low) == 0:
+            return True
+
+        direction = end - start
+
+        if float(direction @ direction) <= 1e-24:
+            return True
+
+        # Slab clip, one axis at a time. An axis the segment does not move
+        # along constrains nothing unless the segment starts outside the slab,
+        # in which case the box is missed outright.
+        parallel = np.abs(direction) <= 1e-12
+        safe = np.where(parallel, 1.0, direction)
+
+        lower = (self.box_low - start) / safe
+        upper = (self.box_high - start) / safe
+
+        entering = np.minimum(lower, upper)
+        exiting = np.maximum(lower, upper)
+
+        outside = parallel[None, :] & (
+            (start[None, :] < self.box_low) | (start[None, :] > self.box_high)
+        )
+        entering = np.where(parallel[None, :], np.where(outside, np.inf, 0.0), entering)
+        exiting = np.where(parallel[None, :], np.where(outside, -np.inf, 1.0), exiting)
+
+        first = np.maximum(entering.max(axis=1), 0.0)
+        last = np.minimum(exiting.min(axis=1), 1.0)
+
+        touched = np.flatnonzero(first <= last)
+
+        if touched.size == 0:
+            return True
+
+        # Probe the middle of the contact interval, on the boxes the segment
+        # actually reaches; a missed box carries an empty interval whose ends
+        # are infinite. The depth is a real distance, so `tol` keeps its
+        # geometric meaning.
+        middle = (
+            start[None, :]
+            + (0.5 * (first[touched] + last[touched]))[:, None] * direction[None, :]
+        )
+        depth = np.maximum(
+            middle - self.box_high[touched], self.box_low[touched] - middle
+        ).max(axis=1)
+
+        return not bool(np.any(depth < -0.5 * tol))
+
+    # ------------------------------------------------------------------ #
+    # Lattice geometry
+    # ------------------------------------------------------------------ #
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        """Number of voxels along x, y and z."""
+        return (
+            round(self.width / self.voxel_size),
+            round(self.height / self.voxel_size),
+            round(self.depth / self.voxel_size),
+        )
+
+    @property
+    def num_voxels(self) -> int:
+        return int(np.prod(self.shape))
+
+    @property
+    def num_faces(self) -> int:
+        """Total number of (voxel, face) slots, aliases included."""
+        return 6 * self.num_voxels
+
+    @property
+    def num_walls(self) -> int:
+        """Number of *distinct* walls, i.e. the sampling universe.
+
+        A wall perpendicular to axis ``a`` sits on one of ``n_a + 1`` grid
+        planes and spans one voxel along each of the other two axes, so the
+        count is the sum over axes of ``(n_a + 1) * n_b * n_c``. This is
+        strictly smaller than :attr:`num_faces` because every interior wall
+        is shared by two voxels.
+        """
+        return sum(
+            int(np.prod(shape))
+            for shape in self._wall_shapes(self.shape)
+        )
+
+    @staticmethod
+    def _wall_shapes(
+        counts: tuple[int, int, int],
+        interior_only: bool = False,
+    ) -> list[tuple[int, int, int]]:
+        """Index-space shape of the wall lattice, one entry per axis.
+
+        Along the perpendicular axis the wall index runs over grid *planes*,
+        of which there are ``n + 1`` (or ``n - 1`` if the two boundary planes
+        are excluded); along the other two it runs over voxels.
+        """
+        shapes = []
+
+        for axis in range(3):
+            shape = list(counts)
+            shape[axis] = counts[axis] - 1 if interior_only else counts[axis] + 1
+            shapes.append(tuple(max(size, 0) for size in shape))
+
+        return shapes
+
+    @staticmethod
+    def _wall_to_voxel_face(
+        counts: tuple[int, int, int],
+        axis: int,
+        cell: tuple[int, int, int],
+        interior_only: bool = False,
+    ) -> tuple[int, int, int, int]:
+        """Canonical ``(i, j, k, face)`` naming the wall ``(axis, cell)``.
+
+        The wall is claimed by the voxel on its negative side, which exists
+        for every plane except the far boundary; that one is claimed by the
+        last voxel via its positive face. Exactly one representative per
+        wall, so duplicates cannot arise.
+        """
+        voxel = list(cell)
+        plane = voxel[axis] + (1 if interior_only else 0)
+
+        if plane < counts[axis]:
+            voxel[axis] = plane
+            face = _NEGATIVE_FACE[axis]
+        else:
+            voxel[axis] = counts[axis] - 1
+            face = _POSITIVE_FACE[axis]
+
+        return (voxel[0], voxel[1], voxel[2], face)
+
+    def _validate_face(self, i: int, j: int, k: int, face: int) -> None:
+        if not 0 <= face < 6:
+            raise ValueError(f"face must be in 0..5, got {face}.")
+
+        for index, count, name in zip((i, j, k), self.shape, "xyz"):
+            if not 0 <= index < count:
+                raise ValueError(
+                    f"voxel index {name}={index} outside 0..{count - 1}."
+                )
+
+    @staticmethod
+    def face_normal(face: int) -> np.ndarray:
+        """Unit outward normal of a face, as a ``(3,)`` array."""
+        if not 0 <= face < 6:
+            raise ValueError(f"face must be in 0..5, got {face}.")
+
+        normal = np.zeros(3, dtype=float)
+        normal[_FACE_AXIS[face]] = float(_FACE_SIGN[face])
+        return normal
+
+    def face_center(self, i: int, j: int, k: int, face: int) -> np.ndarray:
+        """Centre of one blocked face, as a ``(3,)`` array.
+
+        The square is flat: its centre lies exactly on the grid plane the two
+        neighbouring voxels share, so the two voxels describing the same wall
+        give the same point.
+        """
+        self._validate_face(i, j, k, face)
+
+        size = self.voxel_size
+        low = np.array((i, j, k), dtype=float) * size
+
+        centre = low + 0.5 * size
+        axis = _FACE_AXIS[face]
+        centre[axis] = low[axis] + size if _FACE_SIGN[face] > 0 else low[axis]
+
+        return centre
+
+    def face_corners(self, i: int, j: int, k: int, face: int) -> np.ndarray:
+        """The four corners of a blocked face, as a ``(4, 3)`` array.
+
+        Ordered around the square, so consecutive rows (and the last back to
+        the first) are its four edges.
+        """
+        self._validate_face(i, j, k, face)
+
+        size = self.voxel_size
+        low = np.array((i, j, k), dtype=float) * size
+
+        axis = _FACE_AXIS[face]
+        plane = low[axis] + size if _FACE_SIGN[face] > 0 else low[axis]
+
+        first_axis, second_axis = _AXIS_PAIRS[axis]
+
+        # Walk the square, so consecutive corners are joined by an edge.
+        walk = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+
+        corners = np.empty((4, 3), dtype=float)
+        corners[:, axis] = plane
+        corners[:, first_axis] = [low[first_axis] + u * size for u, _ in walk]
+        corners[:, second_axis] = [low[second_axis] + v * size for _, v in walk]
+
+        return corners
+
+    def wall_key(self, i: int, j: int, k: int, face: int) -> tuple[int, int, int, int]:
+        """Identifier of the *physical* wall a face refers to.
+
+        Neighbouring voxels share a wall, so (0, 0, 0, 0) and (1, 0, 0, 2)
+        describe the same slab.  Both map to the same key here.
+        """
+        axis = _FACE_AXIS[face]
+        cell = [i, j, k]
+        plane = cell[axis] + (1 if _FACE_SIGN[face] > 0 else 0)
+        cell[axis] = plane
+        return (cell[0], cell[1], cell[2], axis)
+
+    # ------------------------------------------------------------------ #
+    # Random construction
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _default_voxel_size(width: float, height: float, depth: float) -> float:
+        return min(width / 4.0, height / 4.0, depth / 4.0)
+
+    @staticmethod
+    def _voxel_counts(
+        width: float,
+        height: float,
+        depth: float,
+        voxel_size: float,
+    ) -> tuple[int, int, int]:
+        return tuple(
+            round(extent / voxel_size)
+            for extent in (width, height, depth)
+        )
+
+    @classmethod
+    def random_faces(
+        cls,
+        width: float = 18.0,
+        height: float = 18.0,
+        depth: float = 36.0,
+        voxel_size: float | None = None,
+        min_faces: int = 1,
+        max_faces: int | None = None,
+        interior_only: bool = True,
+        seed: int = None,
+    ):
+        """Block off between ``min_faces`` and ``max_faces`` walls.
+
+        The count is drawn uniformly from that inclusive range, then the
+        walls are drawn uniformly without replacement from the wall lattice.
+        Sampling walls rather than (voxel, face) pairs is what makes the
+        result duplicate free by construction: each wall appears exactly once
+        in the index space, so no draw can name the same slab twice.
+
+        ``interior_only`` drops the walls lying on the outer boundary of the
+        course, which coincide with the container itself.
+        """
+        if voxel_size is None:
+            voxel_size = cls._default_voxel_size(width, height, depth)
+
+        counts = cls._voxel_counts(width, height, depth, voxel_size)
+        shapes = cls._wall_shapes(counts, interior_only)
+        sizes = [int(np.prod(shape)) for shape in shapes]
+        total_walls = sum(sizes)
+
+        if max_faces is None:
+            max_faces = total_walls
+
+        if not 0 <= min_faces <= max_faces <= total_walls:
+            raise ValueError(
+                f"Require 0 <= min_faces <= max_faces <= {total_walls}, got "
+                f"min_faces={min_faces}, max_faces={max_faces}."
+            )
+
+        rng = np.random.default_rng(seed)
+        number_of_walls = int(rng.integers(min_faces, max_faces + 1))
+
+        # One flat draw over the concatenated per-axis wall blocks. Drawing
+        # an axis first would over-weight whichever axis has fewer walls,
+        # since the three blocks are not the same size on a non-cubic grid.
+        flat = rng.choice(total_walls, size=number_of_walls, replace=False)
+        flat.sort()
+
+        obstacles = []
+        offset = 0
+
+        for axis, (shape, size) in enumerate(zip(shapes, sizes)):
+            block = flat[(flat >= offset) & (flat < offset + size)] - offset
+            offset += size
+
+            if block.size == 0:
+                continue
+
+            for cell in zip(*np.unravel_index(block, shape)):
+                obstacles.append(
+                    cls._wall_to_voxel_face(
+                        counts,
+                        axis,
+                        tuple(int(index) for index in cell),
+                        interior_only,
+                    )
+                )
+
+        return cls(
+            width=width,
+            height=height,
+            depth=depth,
+            voxel_size=voxel_size,
+            obstacles=sorted(obstacles),
+        )
+
+    @classmethod
+    def random(
+        cls,
+        width: float = 18.0,
+        height: float = 18.0,
+        depth: float = 36.0,
+        voxel_size: float | None = None,
+        fill_fraction: tuple[float, float] = (0.10, 0.3),
+        interior_only: bool = True,
+        seed: int = None,
+    ):
+        """Block off a random fraction of the walls.
+
+        ``fill_fraction`` is a ``(low, high)`` pair of fractions of the total
+        number of walls. Expressing the amount as a fraction rather than a
+        count keeps the density of the course fixed as the lattice is
+        refined, since the wall count grows as the cube of the resolution.
+        """
+        low_fraction, high_fraction = fill_fraction
+
+        if not 0.0 <= low_fraction <= high_fraction <= 1.0:
+            raise ValueError(
+                "fill_fraction must be a (low, high) pair with "
+                f"0 <= low <= high <= 1, got {fill_fraction}."
+            )
+
+        if voxel_size is None:
+            voxel_size = cls._default_voxel_size(width, height, depth)
+
+        counts = cls._voxel_counts(width, height, depth, voxel_size)
+        total_walls = sum(
+            int(np.prod(shape))
+            for shape in cls._wall_shapes(counts, interior_only)
+        )
+
+        return cls.random_faces(
+            width=width,
+            height=height,
+            depth=depth,
+            voxel_size=voxel_size,
+            min_faces=round(low_fraction * total_walls),
+            max_faces=round(high_fraction * total_walls),
+            interior_only=interior_only,
+            seed=seed,
+        )
+
+    # ------------------------------------------------------------------ #
+    def plot(
+        self,
+        plotter=None,
+        color: str = "cornflowerblue",
+        opacity: float = 1.0,
+        show_edges: bool = True,
+        edge_color: str = "black",
+        show_boundary: bool = True,
+        show_voxel_grid: bool = False,
+        show_axes: bool = True,
+        title: str = None,
+        window_size: tuple[int, int] = (900, 700),
+        jupyter_backend: str = "trame",
+        show: bool = True,
+    ):
+        """Render the course with PyVista.
+
+        Each wall is drawn as a flat ``pyvista.Plane``: one quad, so the only
+        edges shown are the four real ones.
+
+        ``jupyter_backend="trame"`` gives an interactive widget inside the
+        notebook; pass ``"static"`` for a plain image (useful when exporting
+        the notebook) or ``"html"`` for a self-contained scene.
+        """
+        import pyvista as pv
+
+        own_plotter = plotter is None
+
+        if own_plotter:
+            plotter = pv.Plotter(notebook=True, window_size=window_size)
+
+        for obstacle in self.obstacles:
+            # Plane subdivides into i_resolution x j_resolution quads and
+            # defaults to 10 x 10, which is what draws a grid across the face
+            # once show_edges is on. One quad per wall leaves four edges.
+            plane = pv.Plane(
+                center=self.face_center(*obstacle),
+                direction=self.face_normal(obstacle[3]),
+                i_size=self.voxel_size,
+                j_size=self.voxel_size,
+                i_resolution=1,
+                j_resolution=1,
+            )
+            plotter.add_mesh(
+                plane,
+                color=color,
+                opacity=opacity,
+                show_edges=show_edges,
+                edge_color=edge_color,
+                line_width=1.0,
+                # A wall has no inside, so give the back face the same
+                # material; otherwise half the course renders unlit.
+                backface_params={"color": color, "opacity": opacity},
+            )
+
+        if show_voxel_grid:
+            grid_type = getattr(pv, "ImageData", None) or pv.UniformGrid
+            counts = self.shape
+            grid = grid_type(
+                dimensions=(counts[0] + 1, counts[1] + 1, counts[2] + 1),
+                spacing=(self.voxel_size,) * 3,
+                origin=(0.0, 0.0, 0.0),
+            )
+            plotter.add_mesh(
+                grid,
+                style="wireframe",
+                color="gray",
+                opacity=0.25,
+                line_width=1.0,
+            )
+
+        if show_boundary:
+            outline = pv.Box(
+                bounds=(0.0, self.width, 0.0, self.height, 0.0, self.depth),
+                level=0,
+            ).outline()
+            plotter.add_mesh(outline, color="black", line_width=3.0)
+
+        if show_axes:
+            plotter.show_axes()
+            # The boundary outline already spans the full course, so the
+            # ruler picks up the right extent from the scene bounds.
+            plotter.show_bounds(
+                xtitle="x",
+                ytitle="y",
+                ztitle="z",
+                grid=False,
+                location="outer",
+            )
+
+        if title:
+            plotter.add_title(title)
+
+        plotter.camera_position = "iso"
+
+        if own_plotter:
+            plotter.set_background("white")
+
+        if show:
+            plotter.show(jupyter_backend=jupyter_backend)
+
+        return plotter
+
+    # ------------------------------------------------------------------ #
+    def plot_debug(
+        self,
+        plotter=None,
+        color: str = "cornflowerblue",
+        opacity: float = 0.55,
+        show_edges: bool = True,
+        edge_color: str = "black",
+        show_vertices: bool = True,
+        discretization=None,
+        vertex_color: str = "crimson",
+        vertex_size: float = 10.0,
+        show_boundary: bool = True,
+        show_voxel_grid: bool = False,
+        show_axes: bool = True,
+        title: str = None,
+        window_size: tuple[int, int] = (900, 700),
+        jupyter_backend: str = "trame",
+        show: bool = True,
+    ):
+        """Render the course exactly as the planner sees it.
+
+        :meth:`plot` draws each wall as a flat quad, which reads better but is
+        a simplification: the planner works on solid, mutually overlapping
+        boxes.  This method draws those boxes, so the thickness and the
+        overlaps at every junction are visible, along with the graph vertices.
+        Use it to check the solid model; use :meth:`plot` for figures.
+
+        A semi transparent default is deliberate -- the overlaps are the point,
+        and they are only visible through the faces.
+
+        ``discretization`` is forwarded to :meth:`vertices`, so the points
+        drawn are exactly the nodes the planner would build with the same
+        argument.
+        """
+        import pyvista as pv
+
+        own_plotter = plotter is None
+
+        if own_plotter:
+            plotter = pv.Plotter(notebook=True, window_size=window_size)
+
+        for low, high in zip(self.box_low, self.box_high):
+            # level=0 keeps the box a plain six-quad hexahedron, so the edges
+            # drawn are the twelve real ones.
+            box = pv.Box(
+                bounds=(low[0], high[0], low[1], high[1], low[2], high[2]),
+                level=0,
+                quads=True,
+            )
+            plotter.add_mesh(
+                box,
+                color=color,
+                opacity=opacity,
+                show_edges=show_edges,
+                edge_color=edge_color,
+                line_width=1.0,
+            )
+
+        if show_vertices:
+            vertices = self.vertices(discretization)
+
+            if vertices:
+                plotter.add_mesh(
+                    pv.PolyData(np.asarray(vertices, dtype=float)),
+                    color=vertex_color,
+                    point_size=vertex_size,
+                    render_points_as_spheres=True,
+                )
+
+        if show_voxel_grid:
+            grid_type = getattr(pv, "ImageData", None) or pv.UniformGrid
+            counts = self.shape
+            grid = grid_type(
+                dimensions=(counts[0] + 1, counts[1] + 1, counts[2] + 1),
+                spacing=(self.voxel_size,) * 3,
+                origin=(0.0, 0.0, 0.0),
+            )
+            plotter.add_mesh(
+                grid,
+                style="wireframe",
+                color="gray",
+                opacity=0.25,
+                line_width=1.0,
+            )
+
+        if show_boundary:
+            outline = pv.Box(
+                bounds=(0.0, self.width, 0.0, self.height, 0.0, self.depth),
+                level=0,
+            ).outline()
+            plotter.add_mesh(outline, color="black", line_width=3.0)
+
+        if show_axes:
+            plotter.show_axes()
+            plotter.show_bounds(
+                xtitle="x",
+                ytitle="y",
+                ztitle="z",
+                grid=False,
+                location="outer",
+            )
+
+        if title:
+            plotter.add_title(title)
+
+        plotter.camera_position = "iso"
+
+        if own_plotter:
+            plotter.set_background("white")
+
+        if show:
+            plotter.show(jupyter_backend=jupyter_backend)
+
+        return plotter
+
+    # ------------------------------------------------------------------ #
+    def plot_path(
+        self,
+        start,
+        end,
+        distance_path=None,
+        angle_path=None,
+        plotter=None,
+        color: str = "cornflowerblue",
+        opacity: float = 1.0,
+        show_edges: bool = True,
+        edge_color: str = "black",
+        show_boundary: bool = True,
+        show_voxel_grid: bool = False,
+        show_axes: bool = True,
+        line_width: float = 6.0,
+        marker_radius: float | None = None,
+        title: str = None,
+        window_size: tuple[int, int] = (900, 700),
+        jupyter_backend: str = "trame",
+        show: bool = True,
+    ):
+        """Render the course, the goals, and any computed paths with PyVista.
+
+        The course itself is drawn by :meth:`plot`, so the walls appear as flat
+        quads; :meth:`plot_debug` shows the solid boxes the planner actually
+        uses. Paths are drawn as tubes so they stay legible where they run
+        along a wall surface.
+
+        Legend entries are bare names only. Length, cumulative turning and
+        pressure all belong to :meth:`PathPlanner.plot_pressure`; crowding them
+        into this legend made it unreadable.
+        """
+        import pyvista as pv
+
+        plotter = self.plot(
+            plotter=plotter,
+            color=color,
+            opacity=opacity,
+            show_edges=show_edges,
+            edge_color=edge_color,
+            show_boundary=show_boundary,
+            show_voxel_grid=show_voxel_grid,
+            show_axes=show_axes,
+            title=title,
+            window_size=window_size,
+            show=False,
+        )
+
+        if marker_radius is None:
+            marker_radius = 0.12 * self.voxel_size
+
+        for point, marker_color, label in (
+            (start, "green", "start"),
+            (end, "purple", "end"),
+        ):
+            if point is None:
+                continue
+
+            plotter.add_mesh(
+                pv.Sphere(
+                    radius=marker_radius,
+                    center=np.asarray(point, dtype=float),
+                ),
+                color=marker_color,
+                label=label,
+            )
+
+        for path, path_color, label in (
+            (distance_path, "red", "min distance"),
+            (angle_path, "orange", "min angle"),
+        ):
+            if path is None:
+                continue
+
+            coordinates = np.asarray(path.coords, dtype=float)
+
+            # MultipleLines needs at least two points; a degenerate path would
+            # otherwise raise inside VTK.
+            if len(coordinates) < 2:
+                continue
+
+            plotter.add_mesh(
+                pv.MultipleLines(points=coordinates),
+                color=path_color,
+                line_width=line_width,
+                label=label,
+                render_lines_as_tubes=True,
+            )
+
+        plotter.add_legend(bcolor="white", face="line")
+
+        if show:
+            plotter.show(jupyter_backend=jupyter_backend)
+
+        return plotter

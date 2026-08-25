@@ -4,10 +4,11 @@ import numpy as np
 import itertools
 import shapely
 
+from typing import overload
 from attrs import define, field
 from .constants import _LENGTH_TO_FEET
-from shapely import Point, LineString
-from .obstacle_course import ObstacleCourse
+from shapely import LineString
+from .obstacle_course import ObstacleCourse, ObstacleCourseVoxels
 from .utils import (
     pressure_profile,
     path_metrics
@@ -16,7 +17,7 @@ from .utils import (
 
 @define
 class PathPlanner:
-    obstacle_course: ObstacleCourse
+    obstacle_course: ObstacleCourse | ObstacleCourseVoxels
 
     start: np.ndarray | None = field(default=None)
     end: np.ndarray | None = field(default=None)
@@ -43,131 +44,34 @@ class PathPlanner:
 
         value = np.asarray(value, dtype=float)
 
-        if value.shape != (2,):
+        # The course decides how many coordinates a point carries, so a new
+        # course class needs no change here.
+        dimension = self.obstacle_course.dimension
+
+        if value.shape != (dimension,):
             raise ValueError(
-                f"{attribute.name} must contain exactly two coordinates."
+                f"{attribute.name} must contain exactly {dimension} coordinates."
             )
 
-        if not self.obstacle_course.vaild_goal(value):
+        if not self.obstacle_course.valid_goal(value):
             raise ValueError(
                 f"{attribute.name} is outside the obstacle course or inside an obstacle."
             )
 
     def _goal_generator(self) -> None:
+        """Fill in whichever of start/end was not supplied.
+
+        Where the goals go depends entirely on the geometry, so each course
+        class owns that choice and this is only the hand-off.
         """
-        Generate missing start/end points with maximum straight-line
-        separation inside the valid region.
-
-        If both points are missing, select the farthest pair.
-
-        If only one point is missing, select the valid point farthest
-        from the supplied point.
-        """
-        if self.start is not None and self.end is not None:
-            return
-
-        course_region = shapely.box(
-            0.0,
-            0.0,
-            self.obstacle_course.width,
-            self.obstacle_course.height,
+        self.start, self.end = self.obstacle_course.generate_goals(
+            self.start,
+            self.end,
         )
-
-        obstacles = self.obstacle_course.obstacles or []
-
-        if obstacles:
-            blocked_region = self.obstacle_course.obstacles_region
-
-            valid_region = shapely.difference(
-                course_region,
-                blocked_region,
-            )
-        else:
-            valid_region = course_region
-
-        if valid_region.is_empty or valid_region.area <= 0:
-            raise RuntimeError(
-                "The obstacle course has no valid area for start "
-                "and end points."
-            )
-
-        # The farthest pair of points in a polygonal region can be found
-        # among the vertices of its convex hull.
-        convex_hull = valid_region.convex_hull
-
-        if convex_hull.geom_type != "Polygon":
-            raise RuntimeError(
-                "The valid region does not contain enough area to "
-                "generate distinct start and end points."
-            )
-
-        # The final exterior coordinate repeats the first coordinate,
-        # so remove it.
-        candidates = np.asarray(
-            convex_hull.exterior.coords,
-            dtype=float,
-        )[:-1, :2]
-
-        if len(candidates) < 2:
-            raise RuntimeError(
-                "Not enough valid candidate points were found."
-            )
-
-        if self.start is None and self.end is None:
-            # Calculate the squared distance between every pair of hull
-            # vertices. Squared distance is sufficient because sqrt()
-            # does not change which pair is largest.
-            differences = (
-                candidates[:, np.newaxis, :]
-                - candidates[np.newaxis, :, :]
-            )
-
-            squared_distances = np.sum(
-                differences**2,
-                axis=2,
-            )
-
-            start_index, end_index = np.unravel_index(
-                np.argmax(squared_distances),
-                squared_distances.shape,
-            )
-
-            self.start = candidates[start_index].copy()
-            self.end = candidates[end_index].copy()
-
-        elif self.start is None:
-            fixed_end = np.asarray(
-                self.end,
-                dtype=float,
-            )
-
-            squared_distances = np.sum(
-                (candidates - fixed_end) ** 2,
-                axis=1,
-            )
-
-            self.start = candidates[
-                np.argmax(squared_distances)
-            ].copy()
-
-        else:
-            fixed_start = np.asarray(
-                self.start,
-                dtype=float,
-            )
-
-            squared_distances = np.sum(
-                (candidates - fixed_start) ** 2,
-                axis=1,
-            )
-
-            self.end = candidates[
-                np.argmax(squared_distances)
-            ].copy()
 
     def create_graph(self):
         self.graph = nx.Graph()
-        vertices = self.obstacle_course.vertices
+        vertices = self.obstacle_course.vertices()
         vertices.extend([tuple(self.start), tuple(self.end)])
         self.graph.add_nodes_from(vertices)
 
@@ -488,33 +392,61 @@ class PathPlanner:
 
         return fig, ax
 
+    @overload
     def plot(
         self,
-        ax: plt.Axes = None,
-        show_vertices: bool = True,
-        show_labels: bool = False,
-        title: str = None,
-        show: bool = True,
-        length_units: str = "ft",
-        angle_units: str = "degrees",
+        ax: plt.Axes = ...,
+        show_vertices: bool = ...,
+        show_labels: bool = ...,
+        title: str = ...,
+        show: bool = ...,
     ) -> tuple[plt.Figure, plt.Axes]:
-        """Plot the course, goals, and any computed paths.
+        """Polygonal course (``ObstacleCourse``): Matplotlib.
 
-        Path coordinates are interpreted as ``length_units``. Angles are
-        displayed in degrees by default; pass ``angle_units="radians"``
-        to report them in radians. Pressure is always reported in psi.
+        Draws the obstacles, the start and end markers, and any computed paths
+        on one set of 2D axes, and returns ``(figure, axes)``.
+        """
+
+    @overload
+    def plot(
+        self,
+        plotter=...,
+        color: str = ...,
+        opacity: float = ...,
+        show_edges: bool = ...,
+        edge_color: str = ...,
+        show_boundary: bool = ...,
+        show_voxel_grid: bool = ...,
+        show_axes: bool = ...,
+        line_width: float = ...,
+        marker_radius: float | None = ...,
+        title: str = ...,
+        window_size: tuple[int, int] = ...,
+        jupyter_backend: str = ...,
+        show: bool = ...,
+    ):
+        """Voxel course (``ObstacleCourseVoxels``): PyVista.
+
+        Renders the walls, the start and end spheres, and any computed paths
+        as tubes with a legend, and returns the ``pyvista.Plotter``.
+        """
+
+    def plot(self, *args, **kwargs):
+        """Plot the course, the goals, and any computed paths.
+
+        Every argument is forwarded to the course's ``plot_path``, so the
+        parameters depend on which course is held; see the overloads above.
+        Positional arguments continue from the parameter after the goals and
+        paths, which this method supplies.
+
+        Legend entries are bare names. The length, cumulative turning and
+        pressure of each path are reported by :meth:`plot_pressure`.
         """
         return self.obstacle_course.plot_path(
             self.start,
             self.end,
-            distance_path=self.distance_path,
-            angle_path=self.angle_path,
-            ax=ax,
-            show_vertices=show_vertices,
-            show_labels=show_labels,
-            title=title,
-            show=show,
-            length_units=length_units,
-            angle_units=angle_units
+            self.distance_path,
+            self.angle_path,
+            *args,
+            **kwargs,
         )
-
