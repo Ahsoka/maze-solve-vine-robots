@@ -21,6 +21,11 @@ from .utils import (
 )
 
 
+# Every artist on a 2D axes is drawn below this, so the legend is never
+# occluded no matter how many paths are added later.
+_LEGEND_ZORDER = 100
+
+
 class VisibilityMixin:
     """All-pairs visibility on top of a course's batched ``is_visible``.
 
@@ -474,13 +479,21 @@ class ObstacleCourse(VisibilityMixin):
             # second selected path is the shortest one obeying the endpoint-
             # disjointness requirement, rather than merely using a different
             # A-to-B edge.
+            #
+            # This is the last networkx dependency in the package. The planner
+            # itself runs on CSR arrays; Yen's k-shortest-loopless-paths is
+            # kept because reimplementing it correctly would be a hundred
+            # lines of bug surface to save a dependency, and because this call
+            # runs once on a two-obstacle course of a dozen vertices, nowhere
+            # near the memory or the hot path. `to_networkx` builds the graph
+            # on demand rather than caching it.
             chosen_bridges = []
             first_a_vertex = None
             first_b_vertex = None
 
             try:
                 candidate_paths = nx.shortest_simple_paths(
-                    simplified_planner.graph,
+                    simplified_planner.to_networkx(),
                     source=start_node,
                     target=end_node,
                     weight="weight",
@@ -908,6 +921,7 @@ class ObstacleCourse(VisibilityMixin):
         end,
         distance_path = None,
         angle_path = None,
+        pressure_path = None,
         ax: plt.Axes = None,
         show_vertices: bool = True,
         show_labels: bool = False,
@@ -915,13 +929,19 @@ class ObstacleCourse(VisibilityMixin):
         show: bool = True,
         length_units: str = "ft",
         angle_units: str = "degrees",
+        model_parameters: dict | None = None,
     ) -> tuple[plt.Figure, plt.Axes]:
         """Plot the course, goals, and any computed paths.
 
         Path coordinates are interpreted as ``length_units``. Angles are
         displayed in degrees by default; pass ``angle_units="radians"``
         to report them in radians. Pressure is always reported in psi.
+
+        ``model_parameters`` is forwarded to ``path_pressure`` so the
+        pressures in the legend come from the same model the planner
+        optimised; ``PathPlanner.plot`` supplies it automatically.
         """
+        model_parameters = dict(model_parameters or {})
         normalized_length_units = length_units.lower()
         if normalized_length_units not in _LENGTH_TO_FEET:
             raise ValueError(
@@ -968,68 +988,59 @@ class ObstacleCourse(VisibilityMixin):
             zorder=5,
         )
 
-        if distance_path is not None:
-            distance_coords = np.asarray(
-                distance_path.coords,
-                dtype=float,
-            )
-            distance_length, distance_angle_radians = path_metrics(
-                distance_path
-            )
-            distance_angle_display = (
-                distance_angle_radians * angle_scale
-            )
+        # Drawn worst-first so the minimum-pressure path lands on top where
+        # the three overlap.
+        drawn = (
+            (distance_path, "min distance", "tab:red", "-", 4),
+            (angle_path, "min angle", "tab:orange", "--", 5),
+            (pressure_path, "min pressure", "magenta", "-.", 6),
+        )
+
+        for path, name, color, linestyle, zorder in drawn:
+            if path is None:
+                continue
+
+            path_coords = np.asarray(path.coords, dtype=float)
+            path_length, path_angle_radians = path_metrics(path)
+
             # The recursive model depends on where each bend sits along
             # the path, not just the totals, so the pressure is evaluated
             # from the path geometry rather than from (length, angle).
-            distance_pressure = path_pressure(
-                distance_path,
+            pressure = path_pressure(
+                path,
                 length_units=normalized_length_units,
+                **model_parameters,
             )
 
             ax.plot(
-                distance_coords[:, 0],
-                distance_coords[:, 1],
+                path_coords[:, 0],
+                path_coords[:, 1],
                 linewidth=2.5,
-                color="tab:red",
+                linestyle=linestyle,
+                color=color,
                 label=(
-                    "min distance "
-                    f"(length={distance_length:.2f} {normalized_length_units}, "
-                    f"angle={distance_angle_display:.2f} {angle_label}, "
-                    f"pressure={distance_pressure:.3f} psi)"
+                    f"{name} "
+                    f"(length={path_length:.2f} {normalized_length_units}, "
+                    f"angle={path_angle_radians * angle_scale:.2f} {angle_label}, "
+                    f"pressure={pressure:.3f} psi)"
                 ),
-                zorder=4,
+                zorder=zorder,
             )
 
-        if angle_path is not None:
-            angle_coords = np.asarray(
-                angle_path.coords,
-                dtype=float,
-            )
-            angle_length, angle_cost_radians = path_metrics(angle_path)
+        # Matplotlib gives a legend zorder=5 by default, which sits *below*
+        # the goal markers and the minimum-pressure path. Anything drawn on
+        # the axes has to stay under it, so the legend is lifted clear of
+        # every zorder used above rather than nudged just past the current
+        # maximum. An opaque frame is part of the same fix: at the default
+        # framealpha the obstacles show through the box and the entries are
+        # no easier to read for being on top.
+        legend = ax.legend(framealpha=1.0)
+        legend.set_zorder(_LEGEND_ZORDER)
 
-            angle_cost_display = angle_cost_radians * angle_scale
-            angle_pressure = path_pressure(
-                angle_path,
-                length_units=normalized_length_units,
-            )
+        if show:
+            plt.show()
 
-            ax.plot(
-                angle_coords[:, 0],
-                angle_coords[:, 1],
-                linewidth=2.5,
-                linestyle="--",
-                color="tab:orange",
-                label=(
-                    "min angle "
-                    f"(length={angle_length:.2f} {normalized_length_units}, "
-                    f"angle={angle_cost_display:.2f} {angle_label}, "
-                    f"pressure={angle_pressure:.3f} psi)"
-                ),
-                zorder=4,
-            )
-
-        ax.legend()
+        return fig, ax
 
 
 # ---------------------------------------------------------------------------
@@ -2038,6 +2049,7 @@ class ObstacleCourseVoxels(VisibilityMixin):
         end,
         distance_path=None,
         angle_path=None,
+        pressure_path=None,
         plotter=None,
         color: str = "cornflowerblue",
         opacity: float = 1.0,
@@ -2052,6 +2064,9 @@ class ObstacleCourseVoxels(VisibilityMixin):
         window_size: tuple[int, int] = (900, 700),
         jupyter_backend: str = "trame",
         show: bool = True,
+        length_units: str = "ft",
+        angle_units: str = "degrees",
+        model_parameters: dict | None = None,
     ):
         """Render the course, the goals, and any computed paths with PyVista.
 
@@ -2062,7 +2077,10 @@ class ObstacleCourseVoxels(VisibilityMixin):
 
         Legend entries are bare names only. Length, cumulative turning and
         pressure all belong to :meth:`PathPlanner.plot_pressure`; crowding them
-        into this legend made it unreadable.
+        into this legend made it unreadable. ``length_units``, ``angle_units``
+        and ``model_parameters`` are accepted for signature parity with the
+        polygonal course -- ``PathPlanner.plot`` forwards them to whichever
+        course it holds -- and are unused here for that reason.
         """
         import pyvista as pv
 
@@ -2102,6 +2120,7 @@ class ObstacleCourseVoxels(VisibilityMixin):
         for path, path_color, label in (
             (distance_path, "red", "min distance"),
             (angle_path, "orange", "min angle"),
+            (pressure_path, "magenta", "min pressure"),
         ):
             if path is None:
                 continue
