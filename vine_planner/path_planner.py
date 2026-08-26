@@ -1,8 +1,6 @@
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
-import itertools
-import shapely
 
 from typing import overload
 from attrs import define, field
@@ -23,7 +21,15 @@ class PathPlanner:
     end: np.ndarray | None = field(default=None)
 
     graph: nx.Graph = field(init=False)
-    line_graph: nx.DiGraph = field(init=False)
+    line_graph: nx.DiGraph = field(init=False, default=None)
+
+    # Nodes are integers indexing into `coords`; the array is the only place
+    # coordinates live. Keying networkx by float tuples instead means every
+    # cost calculation has to rebuild arrays out of them, which dominates
+    # line-graph construction.
+    coords: np.ndarray | None = field(init=False, default=None)
+    start_index: int | None = field(init=False, default=None)
+    end_index: int | None = field(init=False, default=None)
 
     angle_path: LineString | None = field(init=False, default=None)
     total_angle: float | None = field(init=False, default=None)
@@ -70,117 +76,150 @@ class PathPlanner:
         )
 
     def create_graph(self):
-        self.graph = nx.Graph()
-        vertices = self.obstacle_course.vertices()
-        vertices.extend([tuple(self.start), tuple(self.end)])
-        self.graph.add_nodes_from(vertices)
+        """Build the visibility graph over the course vertices plus the goals.
 
-        for edge in itertools.combinations(vertices, 2):
-            if self.obstacle_course.is_visible(*edge):
-                self.graph.add_edge(
-                    *edge,
-                    weight=np.linalg.norm(np.array(edge[0]) - np.array(edge[1]))
-                )
+        Nodes are integer indices into :attr:`coords`. Edge weights are
+        computed for the whole edge list in one call rather than per edge.
+        """
+        course = self.obstacle_course
+
+        vertices = np.asarray(course.vertices(), dtype=float)
+        start = np.asarray(self.start, dtype=float)
+        end = np.asarray(self.end, dtype=float)
+
+        coords = np.vstack([vertices, start[None, :], end[None, :]])
+
+        # A goal may coincide with an obstacle vertex. With coordinate tuples
+        # as labels that merged silently; with integer labels it would instead
+        # create two nodes at one point joined by a zero-length edge, which has
+        # no turning angle and breaks the line graph.
+        _, first_seen, inverse = np.unique(
+            np.round(coords, 9),
+            axis=0,
+            return_index=True,
+            return_inverse=True,
+        )
+
+        keep = np.sort(first_seen)
+        position = np.empty(len(keep), dtype=np.int64)
+        position[np.argsort(first_seen)] = np.arange(len(keep))
+
+        self.coords = coords[keep]
+        self.start_index = int(position[inverse[len(coords) - 2]])
+        self.end_index = int(position[inverse[len(coords) - 1]])
+
+        first, second = course.visible_pairs(self.coords)
+
+        weights = np.linalg.norm(
+            self.coords[first] - self.coords[second],
+            axis=1,
+        )
+
+        self.graph = nx.Graph()
+        self.graph.add_nodes_from(range(len(self.coords)))
+        self.graph.add_weighted_edges_from(
+            zip(first.tolist(), second.tolist(), weights.tolist())
+        )
+
+        return self.graph
 
     def create_line_graph(self):
         """Build the *directed* line graph of the visibility graph.
 
-        A node is an ordered pair ``(u, v)``, read as "the robot
-        traverses the visibility edge ``{u, v}`` from ``u`` toward
-        ``v``". An arc joins ``(u, v)`` to ``(v, w)`` and carries the
-        unsigned turning angle at ``v``. Reversals ``(u, v) -> (v, u)``
-        are excluded because a vine robot cannot double back along its
-        own body.
+        A node is an ordered pair ``(u, v)``, read as "the robot traverses the
+        visibility edge ``{u, v}`` from ``u`` toward ``v``". An arc joins
+        ``(u, v)`` to ``(v, w)`` and carries the unsigned turning angle at
+        ``v``. Reversals ``(u, v) -> (v, u)`` are excluded because a vine robot
+        cannot double back along its own body.
 
         Encoding the direction of travel in the node is what makes the
-        construction sound: every directed path is a legal walk in the
-        original graph by construction, and every transition cost is
-        evaluated with the same orientation that the walk actually uses.
-        An undirected line graph cannot guarantee either, because two
-        consecutive line-graph edges may share the same original vertex,
-        which silently encodes an uncharged U-turn.
+        construction sound: every directed path is a legal walk in the original
+        graph by construction, and every transition cost is evaluated with the
+        same orientation the walk actually uses. An undirected line graph
+        cannot guarantee either, because two consecutive line-graph edges may
+        share the same original vertex, which silently encodes an uncharged
+        U-turn.
+
+        The transitions are enumerated with array arithmetic rather than
+        ``itertools.permutations`` over each vertex's neighbours: sorting the
+        directed edges by source groups every vertex's neighbours into a
+        contiguous block, and a flat counter then decodes into the ordered
+        pairs within each block.
         """
         self.line_graph = nx.DiGraph()
 
         # One node per directed traversal of each visibility edge.
         self.line_graph.add_nodes_from(self.graph.to_directed().edges)
 
-        # Every legal transition through a vertex: arrive from
-        # ``previous``, leave toward ``next_point``. ``permutations``
-        # already excludes ``previous == next_point``, i.e. reversals.
-        transitions = [
-            ((previous, shared), (shared, next_point))
-            for shared in self.graph.nodes
-            for previous, next_point in itertools.permutations(
-                self.graph.neighbors(shared),
-                2,
-            )
-        ]
+        edges = np.asarray(list(self.graph.edges), dtype=np.int64)
 
-        if transitions:
-            previous_points = np.asarray(
-                [tail[0] for tail, _ in transitions],
-                dtype=float,
+        if len(edges):
+            count = len(self.coords)
+
+            # Each undirected edge twice, then grouped by source vertex.
+            sources = np.concatenate([edges[:, 0], edges[:, 1]])
+            targets = np.concatenate([edges[:, 1], edges[:, 0]])
+
+            order = np.argsort(sources, kind="stable")
+            sources, targets = sources[order], targets[order]
+
+            degree = np.bincount(sources, minlength=count)
+            block_start = np.concatenate([[0], np.cumsum(degree)[:-1]])
+
+            # deg * (deg - 1) ordered pairs of distinct neighbours per vertex.
+            pairs_per_vertex = degree * (degree - 1)
+            total = int(pairs_per_vertex.sum())
+
+        if len(edges) and total:
+            base = np.repeat(block_start, pairs_per_vertex)
+            local_degree = np.repeat(degree, pairs_per_vertex)
+
+            offset = np.arange(total) - np.repeat(
+                np.concatenate([[0], np.cumsum(pairs_per_vertex)[:-1]]),
+                pairs_per_vertex,
             )
-            shared_points = np.asarray(
-                [tail[1] for tail, _ in transitions],
-                dtype=float,
-            )
-            next_points = np.asarray(
-                [head[1] for _, head in transitions],
-                dtype=float,
-            )
+
+            incoming_slot = offset // (local_degree - 1)
+            outgoing_slot = offset % (local_degree - 1)
+
+            # Skip the pair a vertex would make with itself; shifting past it
+            # is what excludes the reversal without a branch.
+            outgoing_slot = outgoing_slot + (outgoing_slot >= incoming_slot)
+
+            shared = np.repeat(np.arange(count), pairs_per_vertex)
+            previous = targets[base + incoming_slot]
+            following = targets[base + outgoing_slot]
 
             # Direction of travel into and out of the shared vertex.
-            incoming_vectors = shared_points - previous_points
-            outgoing_vectors = next_points - shared_points
+            incoming_vectors = self.coords[shared] - self.coords[previous]
+            outgoing_vectors = self.coords[following] - self.coords[shared]
 
-            incoming_lengths = np.linalg.norm(
-                incoming_vectors,
-                axis=1,
-            )
-            outgoing_lengths = np.linalg.norm(
-                outgoing_vectors,
-                axis=1,
-            )
+            incoming_lengths = np.linalg.norm(incoming_vectors, axis=1)
+            outgoing_lengths = np.linalg.norm(outgoing_vectors, axis=1)
 
-            if (
-                np.any(incoming_lengths == 0)
-                or np.any(outgoing_lengths == 0)
-            ):
+            if np.any(incoming_lengths == 0) or np.any(outgoing_lengths == 0):
                 raise RuntimeError(
-                    "Cannot calculate a turning angle for a "
-                    "zero-length edge."
+                    "Cannot calculate a turning angle for a zero-length edge."
                 )
 
-            # Vectorized cosine calculation for every turn.
-            dot_products = np.einsum(
+            cosine_angles = np.einsum(
                 "ij,ij->i",
                 incoming_vectors,
                 outgoing_vectors,
-            )
-
-            cosine_angles = dot_products / (
-                incoming_lengths * outgoing_lengths
-            )
+            ) / (incoming_lengths * outgoing_lengths)
 
             # Protect arccos from small floating-point errors such as
             # 1.0000000000000002.
-            cosine_angles = np.clip(
-                cosine_angles,
-                -1.0,
-                1.0,
-            )
+            turning_angles = np.arccos(np.clip(cosine_angles, -1.0, 1.0))
 
-            turning_angles = np.arccos(cosine_angles)
-
-            # Assign the precomputed turning costs.
             self.line_graph.add_edges_from(
-                (tail, head, {"weight": float(angle)})
-                for (tail, head), angle in zip(
-                    transitions,
-                    turning_angles,
-                    strict=True,
+                ((int(tail), int(middle)), (int(middle), int(head)),
+                 {"weight": float(angle)})
+                for tail, middle, head, angle in zip(
+                    previous.tolist(),
+                    shared.tolist(),
+                    following.tolist(),
+                    turning_angles.tolist(),
                 )
             )
 
@@ -191,28 +230,21 @@ class PathPlanner:
         start_node = "start"
         end_node = "end"
 
-        original_start = tuple(
-            np.asarray(self.start, dtype=float)
-        )
-        original_end = tuple(
-            np.asarray(self.end, dtype=float)
-        )
-
         self.line_graph.add_node(start_node)
         self.line_graph.add_node(end_node)
 
-        # The first segment leaves the start; the last segment arrives
-        # at the goal. Neither incurs a turning cost.
-        for neighbor in self.graph.neighbors(original_start):
+        # The first segment leaves the start; the last segment arrives at the
+        # goal. Neither incurs a turning cost.
+        for neighbor in self.graph.neighbors(self.start_index):
             self.line_graph.add_edge(
                 start_node,
-                (original_start, neighbor),
+                (self.start_index, neighbor),
                 weight=0.0,
             )
 
-        for neighbor in self.graph.neighbors(original_end):
+        for neighbor in self.graph.neighbors(self.end_index):
             self.line_graph.add_edge(
-                (neighbor, original_end),
+                (neighbor, self.end_index),
                 end_node,
                 weight=0.0,
             )
@@ -221,14 +253,11 @@ class PathPlanner:
 
     def compute_distance_path(self) -> LineString:
         """Compute and store the minimum-distance visibility-graph path."""
-        start = tuple(np.asarray(self.start, dtype=float))
-        end = tuple(np.asarray(self.end, dtype=float))
-
         try:
-            path_vertices = nx.shortest_path(
+            path_indices = nx.shortest_path(
                 self.graph,
-                source=start,
-                target=end,
+                source=self.start_index,
+                target=self.end_index,
                 weight="weight",
             )
         except nx.NetworkXNoPath as error:
@@ -236,7 +265,7 @@ class PathPlanner:
                 "No collision-free distance path exists between start and end."
             ) from error
 
-        self.distance_path = LineString(path_vertices)
+        self.distance_path = LineString(self.coords[path_indices])
         return self.distance_path
 
     def compute_angle_path(self) -> LineString:
@@ -258,19 +287,19 @@ class PathPlanner:
         # followed by the head of each in turn.
         directed_edges = line_path[1:-1]
 
-        start = tuple(np.asarray(self.start, dtype=float))
-        end = tuple(np.asarray(self.end, dtype=float))
+        path_indices = [directed_edges[0][0]]
+        path_indices.extend(head for _, head in directed_edges)
 
-        path_vertices = [directed_edges[0][0]]
-        path_vertices.extend(head for _, head in directed_edges)
-
-        if path_vertices[0] != start or path_vertices[-1] != end:
+        if (
+            path_indices[0] != self.start_index
+            or path_indices[-1] != self.end_index
+        ):
             raise RuntimeError(
                 "The reconstructed angle path does not run from the "
                 "start to the goal."
             )
 
-        self.angle_path = LineString(path_vertices)
+        self.angle_path = LineString(self.coords[path_indices])
         self.total_angle = float(
             nx.path_weight(
                 self.line_graph,

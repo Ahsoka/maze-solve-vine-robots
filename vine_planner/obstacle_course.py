@@ -21,9 +21,59 @@ from .utils import (
 )
 
 
+class VisibilityMixin:
+    """All-pairs visibility on top of a course's batched ``is_visible``.
+
+    A course only has to answer "are these segments clear?"; turning that into
+    the pair list a visibility graph needs is identical for every course, so it
+    lives here rather than in each class.
+
+    Chunking is the reason this is not left to the caller. The pair count grows
+    as ``n**2``: at 5,000 vertices that is 12.5 million pairs, and the index
+    arrays alone run to hundreds of megabytes before any geometry is touched.
+    """
+
+    def visible_pairs(self, points, chunk: int = 2_000_000):
+        """Index arrays ``(i, j)``, ``i < j``, of every mutually visible pair."""
+        points = np.asarray(points, dtype=float)
+        count = len(points)
+
+        if count < 2:
+            empty = np.zeros(0, dtype=np.int64)
+            return empty, empty.copy()
+
+        first, second = [], []
+
+        # Walk the upper triangle a row-block at a time so the index arrays
+        # never exist in full.
+        rows_per_chunk = max(1, chunk // max(count, 1))
+
+        for low in range(0, count - 1, rows_per_chunk):
+            high = min(low + rows_per_chunk, count - 1)
+
+            rows = np.arange(low, high)
+            widths = count - rows - 1
+
+            row_index = np.repeat(rows, widths)
+            column_index = (
+                np.arange(len(row_index))
+                - np.repeat(np.concatenate([[0], np.cumsum(widths)[:-1]]), widths)
+                + row_index
+                + 1
+            )
+
+            visible = np.asarray(
+                self.is_visible(points[row_index], points[column_index])
+            )
+
+            first.append(row_index[visible])
+            second.append(column_index[visible])
+
+        return np.concatenate(first), np.concatenate(second)
+
 
 @define
-class ObstacleCourse:
+class ObstacleCourse(VisibilityMixin):
     width: float = field(default=25.0, converter=float, validator=[validators.instance_of(float), validators.gt(0)])
     height: float = field(default=25.0, converter=float, validator=[validators.instance_of(float), validators.gt(0)])
     obstacles: list[Polygon] = field(factory=list)
@@ -401,12 +451,13 @@ class ObstacleCourse:
                 end=np.array([width, height]),
             )
 
-            start_node = tuple(
-                np.asarray(simplified_planner.start, dtype=float)
-            )
-            end_node = tuple(
-                np.asarray(simplified_planner.end, dtype=float)
-            )
+            # The planner keys its graph by integer index into `coords`, so
+            # the search runs on indices and the result is mapped back to
+            # coordinates for bridge_segment, which compares against the
+            # obstacles' own vertex tuples.
+            start_node = simplified_planner.start_index
+            end_node = simplified_planner.end_index
+            planner_coords = simplified_planner.coords
 
             obstacle_a_vertices = set(
                 simplified_course.obstacles[0].exterior.coords[:-1]
@@ -435,7 +486,10 @@ class ObstacleCourse:
                     weight="weight",
                 )
 
-                for path_vertices in candidate_paths:
+                for path_indices in candidate_paths:
+                    path_vertices = [
+                        tuple(planner_coords[index]) for index in path_indices
+                    ]
                     bridge = bridge_segment(path_vertices, obstacle_a_vertices, obstacle_b_vertices)
 
                     if bridge is None:
@@ -729,19 +783,70 @@ class ObstacleCourse:
             obstacles=polygons,
         )
 
-    def vertices(self):
-        vertices = []
-        for point in itertools.chain.from_iterable(
-            map(lambda obstacle: obstacle.exterior.coords[:-1], self.obstacles)
-        ):
-            if not shapely.contains_xy(self.obstacles_region, *point):
-                vertices.append(point)
+    def vertices(self) -> np.ndarray:
+        """``(n, 2)`` obstacle corners that a path could turn around.
 
-        return vertices
+        Returned as an array rather than a list of tuples so the caller can
+        index vertices by integer; the array itself is the index-to-coordinate
+        map.
+        """
+        points = [
+            point
+            for point in itertools.chain.from_iterable(
+                map(
+                    lambda obstacle: obstacle.exterior.coords[:-1],
+                    self.obstacles,
+                )
+            )
+            if not shapely.contains_xy(self.obstacles_region, *point)
+        ]
+
+        if not points:
+            return np.zeros((0, 2), dtype=float)
+
+        return np.asarray(points, dtype=float)[:, :2]
 
     def is_visible(self, vertex1, vertex2):
-        line = shapely.LineString((vertex1, vertex2))
-        return self.obstacles_region.disjoint(line) or self.obstacles_region.touches(line)
+        """Are the segments ``vertex1[k] -> vertex2[k]`` free of every obstacle?
+
+        Accepts a single pair of points or two ``(n, 2)`` arrays, and returns a
+        ``bool`` or an ``(n,)`` array to match.
+
+        Shapely 2's predicates are numpy ufuncs that broadcast one geometry
+        against an array of them, so the whole batch crosses into GEOS in a
+        single call. ``shapely.prepare`` was applied to the obstacle region at
+        construction, which builds its index once instead of per query.
+        """
+        start = np.asarray(vertex1, dtype=float)
+        end = np.asarray(vertex2, dtype=float)
+
+        scalar = start.ndim == 1 and end.ndim == 1
+
+        start = np.atleast_2d(start)
+        end = np.atleast_2d(end)
+        start, end = np.broadcast_arrays(start, end)
+
+        if len(start) == 0:
+            return np.zeros(0, dtype=bool)
+
+        # One C call builds every segment, rather than one Python object at a
+        # time.
+        coordinates = np.empty((2 * len(start), 2), dtype=float)
+        coordinates[0::2] = start
+        coordinates[1::2] = end
+
+        lines = shapely.linestrings(
+            coordinates,
+            indices=np.repeat(np.arange(len(start)), 2),
+        )
+
+        region = self.obstacles_region
+
+        # "touches" keeps a path that runs along an obstacle boundary legal,
+        # which is what a minimum-pressure path wants to do.
+        visible = shapely.disjoint(region, lines) | shapely.touches(region, lines)
+
+        return bool(visible[0]) if scalar else visible
 
     def plot(
         self,
@@ -977,7 +1082,7 @@ _AXIS_PAIRS = ((1, 2), (0, 2), (0, 1))
 
 
 @define
-class ObstacleCourseVoxels:
+class ObstacleCourseVoxels(VisibilityMixin):
     width: float = field(default=18.0, converter=float, validator=[validators.instance_of(float), validators.gt(0)])
     height: float = field(default=18.0, converter=float, validator=[validators.instance_of(float), validators.gt(0)])
     depth: float = field(default=36.0, converter=float, validator=[validators.instance_of(float), validators.gt(0)])
@@ -990,11 +1095,21 @@ class ObstacleCourseVoxels:
     thickness: float | None = field(default=None)
     dilation: float | None = field(default=None)
 
+    # How the wall edges are sampled into graph vertices. These belong here
+    # rather than as arguments to vertices(): they determine the model just as
+    # thickness and dilation do, and fixing them at construction is what lets
+    # the vertex set be computed once and cached.
+    spacing: float | None = field(default=None)
+    discretization: object | None = field(default=None)
+
     obstacles: list[tuple[int, int, int, int]] = field(factory=list)
 
     # Solid model, built once: (n, 3) lower and upper corners of every wall.
     box_low: np.ndarray = field(init=False, default=None)
     box_high: np.ndarray = field(init=False, default=None)
+
+    # Filled on the first call to vertices().
+    _vertices: np.ndarray | None = field(init=False, default=None)
 
     @voxel_size.validator
     def _voxel_valid(self, attribute, value):
@@ -1037,6 +1152,15 @@ class ObstacleCourseVoxels:
                     "walls a whole voxel apart would merge."
                 )
             setattr(self, name, value)
+
+        if self.spacing is None:
+            self.spacing = 0.5 * self.voxel_size
+
+        if self.spacing <= 0.0:
+            raise ValueError(f"spacing must be positive, got {self.spacing}.")
+
+        if self.discretization is None:
+            self.discretization = self.uniform_discretization
 
         bounds = [self.wall_bounds(*obstacle) for obstacle in self.obstacles]
 
@@ -1202,17 +1326,14 @@ class ObstacleCourseVoxels:
         its normal span only ``thickness``, and a fixed count per edge would
         pile up redundant nodes across that sliver.
 
-        ``spacing`` defaults to half a voxel. To vary it without changing the
-        interface, bind it first::
-
-            from functools import partial
-            course.vertices(partial(course.uniform_discretization, spacing=1.0))
+        ``spacing`` defaults to the course's own ``spacing``, so vary it at
+        construction: ``ObstacleCourseVoxels(..., spacing=1.0)``.
         """
         start = np.asarray(start, dtype=float)
         end = np.asarray(end, dtype=float)
 
         if spacing is None:
-            spacing = 0.5 * self.voxel_size
+            spacing = self.spacing
 
         if spacing <= 0.0:
             raise ValueError(f"spacing must be positive, got {spacing}.")
@@ -1226,25 +1347,30 @@ class ObstacleCourseVoxels:
 
         return start[None, :] + fractions * (end - start)[None, :]
 
-    def vertices(self, discretization=None) -> list[tuple[float, float, float]]:
-        """Every point that should become a node of the visibility graph.
+    def vertices(self) -> np.ndarray:
+        """``(n, 3)`` points that should become nodes of the visibility graph.
 
-        That is the corners of the wall boxes plus samples along their edges,
-        since an optimal path in a polyhedral scene bends on edges, not only at
-        corners. ``discretization`` is a callable ``(start, end) -> (m, 3)``
-        returning the samples along one edge; it defaults to
-        :meth:`uniform_discretization`.
+        The corners of the wall boxes plus samples along their edges, since an
+        optimal path in a polyhedral scene bends on edges and not only at
+        corners. How the edges are sampled is fixed by ``spacing`` and
+        ``discretization`` at construction, which makes the result a pure
+        function of the course and so safe to cache.
 
         A point is kept only when it lies inside the course and is not buried
         inside another wall. Burying matters because a node inside a wall would
         let a path cross that wall in two hops, each of which merely touches
         its surface and so grazes legally on its own.
-        """
-        if len(self.box_low) == 0:
-            return []
 
-        if discretization is None:
-            discretization = self.uniform_discretization
+        Returned as an array rather than a list of tuples so the caller can
+        index vertices by integer; the array itself is the index-to-coordinate
+        map.
+        """
+        if self._vertices is not None:
+            return self._vertices
+
+        if len(self.box_low) == 0:
+            self._vertices = np.zeros((0, 3), dtype=float)
+            return self._vertices
 
         corners = self.box_corners()
 
@@ -1253,7 +1379,10 @@ class ObstacleCourseVoxels:
         for box in corners:
             for first, second in self._box_edges():
                 samples.append(
-                    np.asarray(discretization(box[first], box[second]), dtype=float)
+                    np.asarray(
+                        self.discretization(box[first], box[second]),
+                        dtype=float,
+                    )
                 )
 
         points = np.vstack(samples)
@@ -1269,81 +1398,110 @@ class ObstacleCourseVoxels:
             points <= self.extent + 1e-9, axis=1
         )
 
-        points = points[inside_course & ~self.inside_walls(points)]
+        self._vertices = points[inside_course & ~self.inside_walls(points)]
+        return self._vertices
 
-        return [tuple(map(float, point)) for point in points]
+    def is_visible(self, vertex1, vertex2, tol: float = 1e-9):
+        """Are the segments ``vertex1[k] -> vertex2[k]`` free of every wall?
 
-    def is_visible(self, vertex1, vertex2, tol: float = 1e-9) -> bool:
-        """Is the open segment between the two points free of every wall?
+        Accepts a single pair of points or two ``(n, 3)`` arrays, and returns a
+        ``bool`` or an ``(n,)`` array to match.
 
         Each box is clipped independently, which the dilation makes sound (see
-        the note at the top of the file).  Writing the segment as
+        the note at the top of the file). Writing the segment as
         ``x(t) = p + t (q - p)`` and the box as ``lo <= x <= hi``, the six face
         distances are ``x - hi`` and ``lo - x``, each affine in ``t``, so
+        ``g(t) = max`` over the six is convex and piecewise linear. Clipping
+        gives ``[t0, t1]``, the whole of the segment meeting the closed box,
+        and ``g`` vanishes at both ends of it. Convexity then leaves exactly
+        two possibilities: ``g`` is identically zero across the interval,
+        meaning the segment only skims the surface, or strictly negative
+        throughout, meaning it passes through. Probing the middle separates
+        them, so one evaluation per box decides it. A skim stays visible on
+        purpose: a path is allowed to hug a wall.
 
-            g(t) = max over the six faces
-
-        is convex and piecewise linear.  Clipping gives ``[t0, t1]``, the whole
-        of the segment that meets the closed box, and ``g`` vanishes at both
-        ends of it.  Convexity then leaves exactly two possibilities: ``g`` is
-        identically zero across the interval, meaning the segment only skims
-        the surface, or it is strictly negative throughout, meaning the segment
-        passes through.  Probing the middle separates them, so one evaluation
-        per box decides it.
-
-        A skim stays visible on purpose: a path is allowed to hug a wall, and
-        the minimum-pressure path usually wants to.
+        The loop runs over *boxes* while vectorising over *segments*, rather
+        than building one ``(segments, boxes, 3)`` array. That array is far
+        larger than cache at any useful size and the memory traffic costs more
+        than the arithmetic saves; keeping it ``(segments, 3)`` also lets each
+        box narrow the surviving set for the next one.
         """
         start = np.asarray(vertex1, dtype=float)
         end = np.asarray(vertex2, dtype=float)
 
-        if len(self.box_low) == 0:
-            return True
+        scalar = start.ndim == 1 and end.ndim == 1
+
+        start = np.atleast_2d(start)
+        end = np.atleast_2d(end)
+        start, end = np.broadcast_arrays(start, end)
+
+        visible = np.ones(len(start), dtype=bool)
+
+        if len(start) == 0 or len(self.box_low) == 0:
+            return bool(visible[0]) if scalar else visible
 
         direction = end - start
 
-        if float(direction @ direction) <= 1e-24:
-            return True
+        # Degenerate segments touch nothing.
+        visible &= np.einsum("ij,ij->i", direction, direction) > 1e-24
 
-        # Slab clip, one axis at a time. An axis the segment does not move
-        # along constrains nothing unless the segment starts outside the slab,
-        # in which case the box is missed outright.
-        parallel = np.abs(direction) <= 1e-12
-        safe = np.where(parallel, 1.0, direction)
+        segment_low = np.minimum(start, end)
+        segment_high = np.maximum(start, end)
 
-        lower = (self.box_low - start) / safe
-        upper = (self.box_high - start) / safe
+        # Largest walls first: they eliminate the most segments, and every
+        # later box then works on a smaller surviving set.
+        order = np.argsort(-np.prod(self.box_high - self.box_low, axis=1))
 
-        entering = np.minimum(lower, upper)
-        exiting = np.maximum(lower, upper)
+        for box in order:
+            low, high = self.box_low[box], self.box_high[box]
 
-        outside = parallel[None, :] & (
-            (start[None, :] < self.box_low) | (start[None, :] > self.box_high)
-        )
-        entering = np.where(parallel[None, :], np.where(outside, np.inf, 0.0), entering)
-        exiting = np.where(parallel[None, :], np.where(outside, -np.inf, 1.0), exiting)
+            alive = np.flatnonzero(visible)
+            if alive.size == 0:
+                break
 
-        first = np.maximum(entering.max(axis=1), 0.0)
-        last = np.minimum(exiting.min(axis=1), 1.0)
+            # Broad phase: an axis-aligned overlap test rejects most segments
+            # for the cost of six comparisons.
+            near = alive[
+                np.all(segment_high[alive] >= low, axis=1)
+                & np.all(segment_low[alive] <= high, axis=1)
+            ]
+            if near.size == 0:
+                continue
 
-        touched = np.flatnonzero(first <= last)
+            origin = start[near]
+            step = direction[near]
 
-        if touched.size == 0:
-            return True
+            parallel = np.abs(step) <= 1e-12
+            safe = np.where(parallel, 1.0, step)
 
-        # Probe the middle of the contact interval, on the boxes the segment
-        # actually reaches; a missed box carries an empty interval whose ends
-        # are infinite. The depth is a real distance, so `tol` keeps its
-        # geometric meaning.
-        middle = (
-            start[None, :]
-            + (0.5 * (first[touched] + last[touched]))[:, None] * direction[None, :]
-        )
-        depth = np.maximum(
-            middle - self.box_high[touched], self.box_low[touched] - middle
-        ).max(axis=1)
+            lower = (low - origin) / safe
+            upper = (high - origin) / safe
 
-        return not bool(np.any(depth < -0.5 * tol))
+            entering = np.minimum(lower, upper)
+            exiting = np.maximum(lower, upper)
+
+            outside = parallel & ((origin < low) | (origin > high))
+            entering = np.where(parallel, np.where(outside, np.inf, 0.0), entering)
+            exiting = np.where(parallel, np.where(outside, -np.inf, 1.0), exiting)
+
+            first = np.maximum(entering.max(axis=1), 0.0)
+            last = np.minimum(exiting.min(axis=1), 1.0)
+
+            touched = np.flatnonzero(first <= last)
+            if touched.size == 0:
+                continue
+
+            # Probe the middle of the contact interval. The depth is a real
+            # distance, so `tol` keeps its geometric meaning.
+            middle = (
+                origin[touched]
+                + (0.5 * (first[touched] + last[touched]))[:, None] * step[touched]
+            )
+            depth = np.maximum(middle - high, low - middle).max(axis=1)
+
+            visible[near[touched[depth < -0.5 * tol]]] = False
+
+        return bool(visible[0]) if scalar else visible
 
     # ------------------------------------------------------------------ #
     # Lattice geometry
@@ -1529,6 +1687,8 @@ class ObstacleCourseVoxels:
         height: float = 18.0,
         depth: float = 36.0,
         voxel_size: float | None = None,
+        spacing: float | None = None,
+        discretization=None,
         min_faces: int = 1,
         max_faces: int | None = None,
         interior_only: bool = True,
@@ -1596,6 +1756,8 @@ class ObstacleCourseVoxels:
             height=height,
             depth=depth,
             voxel_size=voxel_size,
+            spacing=spacing,
+            discretization=discretization,
             obstacles=sorted(obstacles),
         )
 
@@ -1606,6 +1768,8 @@ class ObstacleCourseVoxels:
         height: float = 18.0,
         depth: float = 36.0,
         voxel_size: float | None = None,
+        spacing: float | None = None,
+        discretization=None,
         fill_fraction: tuple[float, float] = (0.10, 0.3),
         interior_only: bool = True,
         seed: int = None,
@@ -1639,6 +1803,8 @@ class ObstacleCourseVoxels:
             height=height,
             depth=depth,
             voxel_size=voxel_size,
+            spacing=spacing,
+            discretization=discretization,
             min_faces=round(low_fraction * total_walls),
             max_faces=round(high_fraction * total_walls),
             interior_only=interior_only,
