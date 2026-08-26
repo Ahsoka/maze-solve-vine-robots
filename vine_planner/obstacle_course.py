@@ -1935,7 +1935,6 @@ class ObstacleCourseVoxels(VisibilityMixin):
         show_edges: bool = True,
         edge_color: str = "black",
         show_vertices: bool = True,
-        discretization=None,
         vertex_color: str = "crimson",
         vertex_size: float = 10.0,
         show_boundary: bool = True,
@@ -1957,9 +1956,9 @@ class ObstacleCourseVoxels(VisibilityMixin):
         A semi transparent default is deliberate -- the overlaps are the point,
         and they are only visible through the faces.
 
-        ``discretization`` is forwarded to :meth:`vertices`, so the points
-        drawn are exactly the nodes the planner would build with the same
-        argument.
+        The points drawn are exactly the nodes the planner would build, since
+        how the wall edges are sampled is fixed by the course's ``spacing`` and
+        ``discretization`` rather than chosen per call.
         """
         import pyvista as pv
 
@@ -1986,11 +1985,13 @@ class ObstacleCourseVoxels(VisibilityMixin):
             )
 
         if show_vertices:
-            vertices = self.vertices(discretization)
+            # vertices() hands back an (n, 3) array, so test its length; the
+            # truth value of an array is ambiguous.
+            vertices = self.vertices()
 
-            if vertices:
+            if len(vertices):
                 plotter.add_mesh(
-                    pv.PolyData(np.asarray(vertices, dtype=float)),
+                    pv.PolyData(vertices),
                     color=vertex_color,
                     point_size=vertex_size,
                     render_points_as_spheres=True,
