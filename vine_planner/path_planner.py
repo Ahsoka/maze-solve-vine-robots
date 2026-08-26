@@ -7,6 +7,18 @@ from typing import overload
 from attrs import define, field
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra as _csgraph_dijkstra
+
+try:
+    from scipy.sparse.csgraph import yen as _csgraph_yen
+except ImportError as _error:  # pragma: no cover
+    # yen() arrived in SciPy 1.14.0. It replaced this package's last
+    # networkx dependency, so an older SciPy leaves no fallback.
+    raise ImportError(
+        "vine_planner requires SciPy >= 1.14.0 for "
+        "scipy.sparse.csgraph.yen, which provides the k-shortest-paths "
+        "search used by ObstacleCourse.random."
+    ) from _error
+
 from shapely import LineString
 
 from .constants import (
@@ -41,8 +53,8 @@ from .utils import (
 # arcs. That count is driven by the *second moment* of the degree
 # distribution, so a handful of high-degree vertices in an open region cost
 # far more than the average degree suggests. At n = 5,000 vertices with mean
-# degree 50 it is roughly 12 million arcs; materialising them as a networkx
-# DiGraph with tuple keys and a per-edge attribute dict runs to several
+# degree 50 it is roughly 12 million arcs; materialising them as an object
+# graph with tuple keys and a per-arc attribute dict runs to several
 # gigabytes, and the numpy intermediates needed to build it are another
 # gigabyte on top.
 #
@@ -589,15 +601,8 @@ class PathPlanner:
         would not change the answer, and searching the vertex state space is
         ``O(m log n)`` instead of ``O(sum deg^2)``.
         """
-        count = self.vertex_count
-
-        matrix = csr_matrix(
-            (self.edge_length, self.indices, self.indptr),
-            shape=(count, count),
-        )
-
         distances, predecessors = _csgraph_dijkstra(
-            matrix,
+            self.to_scipy_sparse(),
             directed=True,
             indices=self.start_index,
             return_predecessors=True,
@@ -707,94 +712,84 @@ class PathPlanner:
         return field_values
 
     # ------------------------------------------------------------------ #
-    # networkx interoperability
+    # Sparse-matrix views
     # ------------------------------------------------------------------ #
 
-    def set_length_units(self, length_units: str) -> "PathPlanner":
-        """Reinterpret the coordinate units, in place.
+    def to_scipy_sparse(self) -> csr_matrix:
+        """The visibility graph as a SciPy CSR matrix of edge lengths.
 
-        Only the drag term depends on the units, so this recomputes
-        ``edge_drag`` and leaves the visibility graph alone -- which matters,
-        because the graph is by far the expensive part to build. Any computed
-        paths are discarded: they were optimal for the old model and are not
-        guaranteed optimal for the new one.
+        Built on demand and not cached: the arrays it wraps are already the
+        planner's own, and holding a second reference to them buys nothing.
+        Every undirected edge is present in both orientations, so
+        ``directed=True`` is correct for the ``csgraph`` routines.
         """
-        if str(length_units).lower() not in _LENGTH_TO_FEET:
-            raise ValueError(
-                "length_units must be one of: 'ft', 'in', 'm', or 'cm'."
-            )
+        count = self.vertex_count
 
-        self.length_units = str(length_units).lower()
-        self.edge_drag = (
-            self.length_friction * self.edge_length * self.length_scale
+        return csr_matrix(
+            (self.edge_length, self.indices, self.indptr),
+            shape=(count, count),
         )
 
-        self.distance_path = self.angle_path = self.pressure_path = None
-        self.total_distance = self.total_angle = self.total_pressure = None
+    def k_shortest_paths(
+        self,
+        count: int,
+        *,
+        source: int | None = None,
+        target: int | None = None,
+    ) -> list[np.ndarray]:
+        """The ``count`` shortest loopless paths, by total length.
 
-        return self
+        Returns vertex-index arrays in nondecreasing total length. Fewer than
+        ``count`` paths come back when the graph has no more to give, which is
+        how a caller detects exhaustion rather than a truncated result.
 
-    def to_networkx(self):
-        """Build an ``nx.Graph`` of the visibility graph on demand.
-
-        networkx is no longer used by the search. It is retained for two
-        things: ``ObstacleCourse.random`` needs ``shortest_simple_paths``
-        (Yen's algorithm) on a tiny two-obstacle course during generation, and
-        this method is the oracle for differential-testing the CSR rewrite.
-
-        Nothing caches the result, because a cached copy would quietly
-        reintroduce the memory cost the CSR representation exists to avoid.
+        This wraps ``scipy.sparse.csgraph.yen``. Note that it is not a lazy
+        stream: ``count`` is fixed up front, so a caller searching for a path
+        with some property has to choose a budget and grow it.
         """
-        import networkx as nx
+        if count < 1:
+            raise ValueError("count must be at least 1.")
 
-        graph = nx.Graph()
-        graph.add_nodes_from(range(self.vertex_count))
+        source = self.start_index if source is None else int(source)
+        target = self.end_index if target is None else int(target)
 
-        if self.edge_count:
-            sources = self.edge_sources()
-            upper = sources < self.indices
+        distances, predecessors = _csgraph_yen(
+            self.to_scipy_sparse(),
+            source=source,
+            sink=target,
+            K=int(count),
+            directed=True,
+            return_predecessors=True,
+        )
 
-            graph.add_weighted_edges_from(
-                zip(
-                    sources[upper].tolist(),
-                    self.indices[upper].tolist(),
-                    self.edge_length[upper].tolist(),
-                )
-            )
+        paths = []
 
-        return graph
+        for row in range(len(np.atleast_1d(distances))):
+            if not np.isfinite(distances[row]):
+                continue
 
-    def to_networkx_line_graph(self):
-        """Materialise the directed line graph explicitly, for testing only.
+            # scipy marks a vertex that the path does not visit with -9999,
+            # including the source, so the walk terminates on the source
+            # itself rather than on the sentinel.
+            sequence = [target]
+            node = target
 
-        Arc weights are the unsigned turning angles, matching the ``"angle"``
-        objective. This is ``O(sum deg^2)`` in memory and will exhaust it on
-        anything but a small course; that is the whole reason the search does
-        not use it.
-        """
-        import networkx as nx
+            while node != source:
+                node = int(predecessors[row, node])
 
-        graph = nx.DiGraph()
-        graph.add_nodes_from(range(self.edge_count))
+                if node < 0:
+                    sequence = None
+                    break
 
-        for edge in range(self.edge_count):
-            head = int(self.indices[edge])
-            low, high = int(self.indptr[head]), int(self.indptr[head + 1])
+                sequence.append(node)
 
-            for slot in range(low, high):
-                if slot == int(self.reverse[edge]):
-                    continue
+            if sequence is None:
+                continue
 
-                cosine = float(
-                    self.edge_direction[slot] @ self.edge_direction[edge]
-                )
-                graph.add_edge(
-                    edge,
-                    slot,
-                    weight=float(np.arccos(np.clip(cosine, -1.0, 1.0))),
-                )
+            sequence.reverse()
+            paths.append(np.asarray(sequence, dtype=np.int64))
 
-        return graph
+        return paths
 
     # ------------------------------------------------------------------ #
     # Plotting

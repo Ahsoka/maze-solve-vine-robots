@@ -1,6 +1,5 @@
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
-import networkx as nx
 import numpy as np
 import itertools
 import shapely
@@ -25,6 +24,13 @@ from .utils import (
 # Every artist on a 2D axes is drawn below this, so the legend is never
 # occluded no matter how many paths are added later.
 _LEGEND_ZORDER = 100
+
+# Budget for the k-shortest-paths search that picks the two bridges in
+# ``ObstacleCourse.random``. scipy's yen() needs K up front, so the search
+# starts small and doubles; the cap only exists to turn a course that can
+# never satisfy the disjointness requirement into an error instead of a hang.
+_INITIAL_PATH_BUDGET = 16
+_MAXIMUM_PATH_BUDGET = 4096
 
 
 def _length_conversion(source_units: str, target_units: str) -> float:
@@ -519,39 +525,48 @@ class ObstacleCourse(VisibilityMixin):
                 simplified_course.obstacles[1].exterior.coords[:-1]
             )
 
-            # nx.shortest_simple_paths yields paths in nondecreasing total
-            # visibility-graph length. The first usable path is therefore the
-            # shortest path. After fixing its bridge (a_i, b_j), continue in
-            # the same ordered stream and retain the first path whose bridge
-            # (a_k, b_l) satisfies both a_k != a_i and b_l != b_j. Thus the
-            # second selected path is the shortest one obeying the endpoint-
-            # disjointness requirement, rather than merely using a different
-            # A-to-B edge.
+            # Paths arrive in nondecreasing total visibility-graph length,
+            # so the first usable one is the shortest path. After fixing its
+            # bridge (a_i, b_j), continue through the same ordered list and
+            # retain the first path whose bridge (a_k, b_l) satisfies both
+            # a_k != a_i and b_l != b_j. The second selected path is therefore
+            # the shortest one obeying the endpoint-disjointness requirement,
+            # rather than merely one using a different A-to-B edge. That
+            # ordering guarantee is the whole reason a k-shortest-paths
+            # routine is needed here instead of a plain shortest path.
             #
-            # This is the last networkx dependency in the package. The planner
-            # itself runs on CSR arrays; Yen's k-shortest-loopless-paths is
-            # kept because reimplementing it correctly would be a hundred
-            # lines of bug surface to save a dependency, and because this call
-            # runs once on a two-obstacle course of a dozen vertices, nowhere
-            # near the memory or the hot path. `to_networkx` builds the graph
-            # on demand rather than caching it.
+            # scipy's yen() is not a lazy generator: K is fixed up front and
+            # it returns at most K paths. The budget is therefore doubled
+            # until either two acceptable bridges are found or the graph is
+            # exhausted, which is signalled by fewer than K paths coming back.
+            # Rescanning from scratch after each doubling is wasteful in
+            # principle and free in practice, because this runs once on a
+            # two-obstacle course of roughly a dozen vertices.
             chosen_bridges = []
-            first_a_vertex = None
-            first_b_vertex = None
+            budget = _INITIAL_PATH_BUDGET
 
-            try:
-                candidate_paths = nx.shortest_simple_paths(
-                    simplified_planner.to_networkx(),
-                    source=start_node,
-                    target=end_node,
-                    weight="weight",
-                )
+            while True:
+                candidate_paths = simplified_planner.k_shortest_paths(budget)
+
+                if not candidate_paths:
+                    raise RuntimeError(
+                        "The simplified two-obstacle course has no path from "
+                        "(0, 0) to (width, height)."
+                    )
+
+                chosen_bridges = []
+                first_a_vertex = None
+                first_b_vertex = None
 
                 for path_indices in candidate_paths:
                     path_vertices = [
                         tuple(planner_coords[index]) for index in path_indices
                     ]
-                    bridge = bridge_segment(path_vertices, obstacle_a_vertices, obstacle_b_vertices)
+                    bridge = bridge_segment(
+                        path_vertices,
+                        obstacle_a_vertices,
+                        obstacle_b_vertices,
+                    )
 
                     if bridge is None:
                         continue
@@ -573,11 +588,22 @@ class ObstacleCourse(VisibilityMixin):
                     chosen_bridges.append(bridge)
                     break
 
-            except nx.NetworkXNoPath as error:
-                raise RuntimeError(
-                    "The simplified two-obstacle course has no path from "
-                    "(0, 0) to (width, height)."
-                ) from error
+                if len(chosen_bridges) >= 2:
+                    break
+
+                # Fewer paths than asked for means the graph has no more, so
+                # a larger budget cannot help.
+                if len(candidate_paths) < budget:
+                    break
+
+                if budget >= _MAXIMUM_PATH_BUDGET:
+                    raise RuntimeError(
+                        "Could not find a second endpoint-disjoint bridge "
+                        f"within the {_MAXIMUM_PATH_BUDGET} shortest paths of "
+                        "the simplified two-obstacle course."
+                    )
+
+                budget = min(2 * budget, _MAXIMUM_PATH_BUDGET)
 
             if len(chosen_bridges) < 2:
                 raise RuntimeError(
