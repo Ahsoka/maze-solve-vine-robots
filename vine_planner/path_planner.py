@@ -20,6 +20,7 @@ from .obstacle_course import (
     ObstacleCourse,
     ObstacleCourseVoxels,
     _LEGEND_ZORDER,
+    _length_conversion,
 )
 from .utils import (
     pressure_profile,
@@ -99,9 +100,15 @@ class PathPlanner:
 
     # Units the course coordinates are expressed in. The friction term of the
     # pressure model is psi per foot, so the planner has to know this to build
-    # its costs; keeping it here rather than as a plotting argument is what
-    # stops the planner from optimising one model and the plots reporting
-    # another.
+    # its costs.
+    #
+    # This is a *model* parameter, not a display one: it sets the drag term
+    # beta = f * l * scale, and therefore how heavily length is weighed
+    # against bend amplification in the objective. Two planners differing only
+    # in this field are solving different problems and can return different
+    # paths. There is no default that is right for every course -- 'ft' is
+    # only the least surprising one -- so set it to whatever the coordinates
+    # actually mean.
     length_units: str = field(default="ft")
 
     yield_pressure: float = field(default=YIELD_PRESSURE_PSI)
@@ -218,6 +225,26 @@ class PathPlanner:
     # ------------------------------------------------------------------ #
     # Derived quantities
     # ------------------------------------------------------------------ #
+
+    def _resolve_display_units(self, length_units) -> tuple[str, float]:
+        """Normalise a requested display unit and its conversion factor.
+
+        Returns ``(units, scale)`` where ``scale`` takes a length in course
+        coordinate units to ``units``.
+
+        Display units and course units are different things and only the
+        second one is physics. ``self.length_units`` says how big the course
+        actually is, which fixes the drag term and therefore the objective.
+        This says how to write the resulting numbers down, which fixes
+        nothing at all -- an 18 in course reported in feet is the same course,
+        the same robot and the same optimal path, printed as 1.5.
+        """
+        if length_units is None:
+            return str(self.length_units).lower(), 1.0
+
+        target = str(length_units).lower()
+
+        return target, _length_conversion(self.length_units, target)
 
     @property
     def length_scale(self) -> float:
@@ -683,6 +710,30 @@ class PathPlanner:
     # networkx interoperability
     # ------------------------------------------------------------------ #
 
+    def set_length_units(self, length_units: str) -> "PathPlanner":
+        """Reinterpret the coordinate units, in place.
+
+        Only the drag term depends on the units, so this recomputes
+        ``edge_drag`` and leaves the visibility graph alone -- which matters,
+        because the graph is by far the expensive part to build. Any computed
+        paths are discarded: they were optimal for the old model and are not
+        guaranteed optimal for the new one.
+        """
+        if str(length_units).lower() not in _LENGTH_TO_FEET:
+            raise ValueError(
+                "length_units must be one of: 'ft', 'in', 'm', or 'cm'."
+            )
+
+        self.length_units = str(length_units).lower()
+        self.edge_drag = (
+            self.length_friction * self.edge_length * self.length_scale
+        )
+
+        self.distance_path = self.angle_path = self.pressure_path = None
+        self.total_distance = self.total_angle = self.total_pressure = None
+
+        return self
+
     def to_networkx(self):
         """Build an ``nx.Graph`` of the visibility graph on demand.
 
@@ -764,6 +815,14 @@ class PathPlanner:
         Any computed distance, angle and pressure paths are plotted on the
         same axes. Raises ``RuntimeError`` when none has been computed.
 
+        ``length_units`` sets how arclength is *displayed* and defaults to the
+        planner's course units. It is a pure rescaling of the x axis applied
+        after the search: the pressure model is always evaluated in
+        ``self.length_units``, so plotting an 18 in course in feet reports the
+        same pressures against an axis reading 1.5 instead of 18. To state
+        that the course is a different physical size, which does change the
+        optimal path, use ``set_length_units`` and re-solve.
+
         Cumulative turning is reported in the legend for reference. It does
         not determine the pressure on its own: two paths with equal length and
         equal total turning can end at different pressures depending on where
@@ -782,14 +841,9 @@ class PathPlanner:
                 "plot_pressure()."
             )
 
-        normalized_length_units = (
-            self.length_units if length_units is None else length_units
-        ).lower()
-
-        if normalized_length_units not in _LENGTH_TO_FEET:
-            raise ValueError(
-                "length_units must be one of: 'ft', 'in', 'm', or 'cm'."
-            )
+        normalized_length_units, display_scale = self._resolve_display_units(
+            length_units
+        )
 
         normalized_angle_units = angle_units.lower()
         if normalized_angle_units in {"degree", "degrees", "deg"}:
@@ -824,12 +878,16 @@ class PathPlanner:
                 else reported_angle
             )
 
+            # The profile is always computed in the units the course is
+            # actually in, so the physics cannot be changed from here. Only
+            # the returned arclengths are rescaled, for the axis.
             lengths, pressures = pressure_profile(
                 path,
-                length_units=normalized_length_units,
+                length_units=self.length_units,
                 points_per_segment=points_per_segment,
                 **self.model_parameters,
             )
+            lengths = lengths * display_scale
 
             ax.plot(
                 lengths,
@@ -909,11 +967,13 @@ class PathPlanner:
         Positional arguments continue from the parameter after the goals and
         paths, which this method supplies.
 
-        The model parameters and length units are supplied from the planner so
-        the pressures quoted in the legend come from the same model the search
-        optimised.
+        The pressure model parameters and the course units are supplied from
+        the planner, so the pressures quoted in the legend always come from
+        the model the search optimised. A ``length_units`` argument, if given,
+        is a display choice layered on top of that and is passed straight
+        through.
         """
-        kwargs.setdefault("length_units", self.length_units)
+        kwargs["course_units"] = self.length_units
         kwargs.setdefault("model_parameters", self.model_parameters)
 
         return self.obstacle_course.plot_path(

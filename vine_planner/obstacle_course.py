@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
 import networkx as nx
 import numpy as np
 import itertools
@@ -24,6 +25,53 @@ from .utils import (
 # Every artist on a 2D axes is drawn below this, so the legend is never
 # occluded no matter how many paths are added later.
 _LEGEND_ZORDER = 100
+
+
+def _length_conversion(source_units: str, target_units: str) -> float:
+    """Multiplier taking a length in ``source_units`` to ``target_units``.
+
+    Both are resolved through the feet table, so this is exact for every pair
+    the package supports.
+
+    This is a *display* conversion and nothing more. It never touches the
+    pressure model: a course is whatever physical size it is, and rescaling
+    the numbers used to describe it does not change the robot, the maze, or
+    the optimal path through it.
+    """
+    for units in (source_units, target_units):
+        if str(units).lower() not in _LENGTH_TO_FEET:
+            raise ValueError(
+                "length units must be one of: 'ft', 'in', 'm', or 'cm'; "
+                f"got {units!r}."
+            )
+
+    return (
+        _LENGTH_TO_FEET[str(source_units).lower()]
+        / _LENGTH_TO_FEET[str(target_units).lower()]
+    )
+
+
+def _relabel_axis(axis, limits, display_scale: float) -> None:
+    """Show ``axis`` in display units while leaving the data alone.
+
+    Tick positions are chosen so the *labels* are round numbers, which means
+    picking them in display space and dividing back into coordinate space.
+    Reformatting the default ticks would keep the positions round in the wrong
+    units and print things like ``2.08333``.
+    """
+    low, high = (value * display_scale for value in limits)
+
+    locator = ticker.MaxNLocator(nbins=8, steps=[1, 2, 2.5, 5, 10])
+    display_ticks = locator.tick_values(low, high)
+
+    axis.set_major_locator(
+        ticker.FixedLocator(display_ticks / display_scale)
+    )
+    axis.set_major_formatter(
+        ticker.FuncFormatter(
+            lambda value, _position: f"{value * display_scale:g}"
+        )
+    )
 
 
 class VisibilityMixin:
@@ -927,26 +975,46 @@ class ObstacleCourse(VisibilityMixin):
         show_labels: bool = False,
         title: str = None,
         show: bool = True,
-        length_units: str = "ft",
+        course_units: str = "ft",
+        length_units: str | None = None,
         angle_units: str = "degrees",
         model_parameters: dict | None = None,
     ) -> tuple[plt.Figure, plt.Axes]:
         """Plot the course, goals, and any computed paths.
 
-        Path coordinates are interpreted as ``length_units``. Angles are
-        displayed in degrees by default; pass ``angle_units="radians"``
-        to report them in radians. Pressure is always reported in psi.
+        ``course_units`` states what one coordinate unit physically is. That
+        is a property of the course and it is what the pressure model is
+        evaluated in; ``PathPlanner.plot`` supplies it from the planner.
 
-        ``model_parameters`` is forwarded to ``path_pressure`` so the
-        pressures in the legend come from the same model the planner
-        optimised; ``PathPlanner.plot`` supplies it automatically.
+        ``length_units`` is purely how lengths are *displayed*, and defaults
+        to ``course_units``. Setting it rescales the reported path lengths and
+        the axis tick labels and nothing else: an 18 in course shown in feet
+        reads 1.5 ft, and every pressure is unchanged because the course did
+        not change size. Pressure is always psi.
+
+        Angles are displayed in degrees by default; pass
+        ``angle_units="radians"`` to report them in radians.
         """
         model_parameters = dict(model_parameters or {})
-        normalized_length_units = length_units.lower()
-        if normalized_length_units not in _LENGTH_TO_FEET:
+
+        normalized_course_units = str(course_units).lower()
+        if normalized_course_units not in _LENGTH_TO_FEET:
             raise ValueError(
-                "length_units must be one of: 'ft', 'in', 'm', or 'cm'."
+                "course_units must be one of: 'ft', 'in', 'm', or 'cm'."
             )
+        normalized_length_units = (
+            normalized_course_units
+            if length_units is None
+            else str(length_units).lower()
+        )
+
+        # Coordinate units -> display units. The geometry is left in
+        # coordinate units and only the numbers are scaled, so nothing that
+        # feeds the pressure model is touched.
+        display_scale = _length_conversion(
+            normalized_course_units,
+            normalized_length_units,
+        )
 
         normalized_angle_units = angle_units.lower()
         if normalized_angle_units in {"degree", "degrees", "deg"}:
@@ -1006,9 +1074,11 @@ class ObstacleCourse(VisibilityMixin):
             # The recursive model depends on where each bend sits along
             # the path, not just the totals, so the pressure is evaluated
             # from the path geometry rather than from (length, angle).
+            # The model is always evaluated in the units the course is
+            # actually in; the display setting cannot reach it.
             pressure = path_pressure(
                 path,
-                length_units=normalized_length_units,
+                length_units=normalized_course_units,
                 **model_parameters,
             )
 
@@ -1020,12 +1090,26 @@ class ObstacleCourse(VisibilityMixin):
                 color=color,
                 label=(
                     f"{name} "
-                    f"(length={path_length:.2f} {normalized_length_units}, "
+                    f"(length={path_length * display_scale:.2f} "
+                    f"{normalized_length_units}, "
                     f"angle={path_angle_radians * angle_scale:.2f} {angle_label}, "
                     f"pressure={pressure:.3f} psi)"
                 ),
                 zorder=zorder,
             )
+
+        # The obstacles and paths stay in coordinate units -- rescaling the
+        # geometry would mean rebuilding every polygon -- so the axes are
+        # relabelled instead. Ticks are chosen to be round numbers in the
+        # *display* units and then mapped back to coordinate positions;
+        # formatting the default ticks instead would leave 25 in reading as
+        # 2.08333 ft.
+        if display_scale != 1.0:
+            _relabel_axis(ax.xaxis, ax.get_xlim(), display_scale)
+            _relabel_axis(ax.yaxis, ax.get_ylim(), display_scale)
+
+        ax.set_xlabel(f"x ({normalized_length_units})")
+        ax.set_ylabel(f"y ({normalized_length_units})")
 
         # Matplotlib gives a legend zorder=5 by default, which sits *below*
         # the goal markers and the minimum-pressure path. Anything drawn on
@@ -2065,7 +2149,8 @@ class ObstacleCourseVoxels(VisibilityMixin):
         window_size: tuple[int, int] = (900, 700),
         jupyter_backend: str = "trame",
         show: bool = True,
-        length_units: str = "ft",
+        course_units: str = "ft",
+        length_units: str | None = None,
         angle_units: str = "degrees",
         model_parameters: dict | None = None,
     ):
@@ -2078,10 +2163,11 @@ class ObstacleCourseVoxels(VisibilityMixin):
 
         Legend entries are bare names only. Length, cumulative turning and
         pressure all belong to :meth:`PathPlanner.plot_pressure`; crowding them
-        into this legend made it unreadable. ``length_units``, ``angle_units``
-        and ``model_parameters`` are accepted for signature parity with the
-        polygonal course -- ``PathPlanner.plot`` forwards them to whichever
-        course it holds -- and are unused here for that reason.
+        into this legend made it unreadable. ``course_units``,
+        ``length_units``, ``angle_units`` and ``model_parameters`` are
+        accepted for signature parity with the polygonal course --
+        ``PathPlanner.plot`` forwards them to whichever course it holds -- and
+        are unused here because nothing in this view reports a length.
         """
         import pyvista as pv
 
